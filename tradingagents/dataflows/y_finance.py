@@ -12,7 +12,8 @@ from .stockstats_utils import (
     load_ohlcv,
     yf_retry,
 )
-from .symbol_utils import NoMarketDataError, normalize_symbol
+from .eastmoney_stock import get_stock_data_eastmoney
+from .symbol_utils import NoMarketDataError, is_cn_a_share, normalize_symbol
 
 
 def get_YFin_data_online(
@@ -20,6 +21,8 @@ def get_YFin_data_online(
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
 ):
+    if is_cn_a_share(symbol):
+        return get_stock_data_eastmoney(symbol, start_date, end_date)
 
     datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")

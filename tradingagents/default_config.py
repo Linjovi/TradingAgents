@@ -113,12 +113,24 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "global_news_lookback_days": 7,       # macro news lookback window
     # Search queries used by get_global_news for macro headlines. Extend or
     # replace to broaden geographic / sector coverage.
+    # Default set targets global / US market. For A-share analyses the
+    # news_analyst automatically appends cn_global_news_queries instead
+    # (see news_analyst.py).
     "global_news_queries": [
         "Federal Reserve interest rates inflation",
         "S&P 500 earnings GDP economic outlook",
         "geopolitical risk trade war sanctions",
         "ECB Bank of England BOJ central bank policy",
         "oil commodities supply chain energy",
+    ],
+    # China / A-share macro queries — used when the ticker is .SZ / .SS / .BJ.
+    # Covers PBOC policy, Chinese economic data, and A-share market dynamics.
+    "cn_global_news_queries": [
+        "中国人民银行 货币政策 降息 降准",
+        "A股 上证指数 深证成指 市场行情",
+        "中国GDP 工业增加值 PMI 经济数据",
+        "政策利好 产业政策 补贴 国产替代",
+        "中美贸易 关税 供应链 出口",
     ],
     # Data vendor configuration
     # Category-level configuration (default for all tools in category).

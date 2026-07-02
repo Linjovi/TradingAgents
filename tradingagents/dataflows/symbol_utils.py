@@ -136,3 +136,24 @@ def normalize_symbol(raw: str) -> str:
 def is_yahoo_safe(symbol: str) -> bool:
     """True when ``symbol`` only contains characters Yahoo symbols use."""
     return bool(symbol) and _YAHOO_SAFE.fullmatch(symbol) is not None
+
+
+# A-share exchange suffixes recognised by Yahoo Finance and domestic platforms.
+_CN_A_SHARE_SUFFIXES = frozenset({"SZ", "SS", "BJ"})
+
+
+def is_cn_a_share(ticker: str) -> bool:
+    """Return True when ``ticker`` is a Chinese A-share listed on SSE, SZSE, or BSE.
+
+    Recognised suffixes:
+      - ``.SZ``  — Shenzhen Stock Exchange (SZSE), incl. SME Board & ChiNext
+      - ``.SS``  — Shanghai Stock Exchange (SSE), incl. STAR Market
+      - ``.BJ``  — Beijing Stock Exchange (BSE)
+
+    Pure numeric codes without a suffix are not classified as A-shares
+    because they are ambiguous (could be US tickers, internal IDs, etc.).
+    """
+    if not isinstance(ticker, str) or "." not in ticker:
+        return False
+    suffix = ticker.rsplit(".", 1)[-1].strip().upper()
+    return suffix in _CN_A_SHARE_SUFFIXES

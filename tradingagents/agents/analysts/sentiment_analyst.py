@@ -6,12 +6,20 @@ only tool available was Yahoo Finance news — which led LLMs to fabricate
 Reddit/X/StockTwits content under prompt pressure (verified live).
 
 The redesigned agent pre-fetches three complementary data sources before
-the LLM is invoked and injects them into the prompt as structured blocks:
+the LLM is invoked and injects them into the prompt as structured blocks.
 
+**Data source routing (automatic, based on ticker suffix)**
+
+For non-A-share tickers (US, HK, etc.):
   1. News headlines     — Yahoo Finance (institutional framing)
   2. StockTwits messages — retail-trader posts indexed by cashtag, with
                            user-labeled Bullish/Bearish sentiment tags
   3. Reddit posts        — r/wallstreetbets, r/stocks, r/investing
+
+For Chinese A-share tickers (.SZ / .SS / .BJ):
+  1. News headlines     — 东方财富（Eastmoney）中文财经新闻
+  2. 股吧帖子            — 东方财富股吧散户讨论（替代 StockTwits）
+  3. 说明文本            — 说明国内无 Reddit 等境外社区，引导 LLM 利用股吧数据
 
 The agent does not use tool-calling; the data is in the prompt from
 turn 0. Output uses the structured-output pattern (json_schema for
@@ -39,8 +47,11 @@ from tradingagents.agents.utils.structured import (
     bind_structured,
     invoke_structured_or_freetext,
 )
+from tradingagents.dataflows.eastmoney_guba import fetch_guba_posts
+from tradingagents.dataflows.eastmoney_news import get_news_eastmoney
 from tradingagents.dataflows.reddit import fetch_reddit_posts
 from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
+from tradingagents.dataflows.symbol_utils import is_cn_a_share
 
 
 def _seven_days_back(trade_date: str) -> str:
@@ -50,10 +61,14 @@ def _seven_days_back(trade_date: str) -> str:
 def create_sentiment_analyst(llm):
     """Create a sentiment analyst node for the trading graph.
 
-    Pre-fetches news + StockTwits + Reddit data, injects them into the
+    Pre-fetches news + social/community data, injects them into the
     prompt as structured blocks, and produces a deterministic sentiment
     report via structured output (with a free-text fallback for providers
     that do not support it).
+
+    Automatically routes to Chinese domestic data sources (Eastmoney news +
+    Guba stock-bar) for A-share tickers (.SZ / .SS / .BJ), and to
+    Yahoo Finance + StockTwits + Reddit for all other markets.
     """
     structured_llm = bind_structured(llm, SentimentReport, "Sentiment Analyst")
 
@@ -63,21 +78,30 @@ def create_sentiment_analyst(llm):
         start_date = _seven_days_back(end_date)
         instrument_context = get_instrument_context_from_state(state)
 
-        # Pre-fetch all three sources. Each fetcher degrades gracefully and
-        # returns a string (no exceptions surface from here), so the LLM
-        # always sees something — either real data or a clear placeholder.
-        news_block = get_news.func(ticker, start_date, end_date)
-        stocktwits_block = fetch_stocktwits_messages(ticker, limit=30)
-        reddit_block = fetch_reddit_posts(ticker)
-
-        system_message = _build_system_message(
-            ticker=ticker,
-            start_date=start_date,
-            end_date=end_date,
-            news_block=news_block,
-            stocktwits_block=stocktwits_block,
-            reddit_block=reddit_block,
-        )
+        if is_cn_a_share(ticker):
+            # --- A股数据源：东方财富新闻 + 股吧 ---
+            news_block = get_news_eastmoney(ticker, start_date, end_date)
+            guba_block = fetch_guba_posts(ticker, limit=30, trade_date=end_date)
+            system_message = _build_cn_system_message(
+                ticker=ticker,
+                start_date=start_date,
+                end_date=end_date,
+                news_block=news_block,
+                guba_block=guba_block,
+            )
+        else:
+            # --- 海外数据源：Yahoo Finance + StockTwits + Reddit ---
+            news_block = get_news.func(ticker, start_date, end_date)
+            stocktwits_block = fetch_stocktwits_messages(ticker, limit=30)
+            reddit_block = fetch_reddit_posts(ticker)
+            system_message = _build_system_message(
+                ticker=ticker,
+                start_date=start_date,
+                end_date=end_date,
+                news_block=news_block,
+                stocktwits_block=stocktwits_block,
+                reddit_block=reddit_block,
+            )
 
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -97,9 +121,6 @@ def create_sentiment_analyst(llm):
         prompt = prompt.partial(current_date=end_date)
         prompt = prompt.partial(instrument_context=instrument_context)
 
-        # Format the template into a concrete message list so the structured
-        # and free-text paths receive the same input. No bind_tools — the
-        # data is already in the prompt.
         formatted_messages = prompt.format_messages(messages=state["messages"])
 
         report_text = invoke_structured_or_freetext(
@@ -116,6 +137,68 @@ def create_sentiment_analyst(llm):
         }
 
     return sentiment_analyst_node
+
+
+# ---------------------------------------------------------------------------
+# System message builders
+# ---------------------------------------------------------------------------
+
+def _build_cn_system_message(
+    *,
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    news_block: str,
+    guba_block: str,
+) -> str:
+    """为A股构建系统消息，使用东方财富作为数据源。"""
+    return f"""You are a financial market sentiment analyst specialising in Chinese A-share markets. Your task is to produce a comprehensive sentiment report for {ticker} covering the period from {start_date} to {end_date}, drawing on two complementary domestic data sources that have already been collected for you.
+
+## 数据来源（已预取，直接在本 Prompt 中）
+
+### ① 财经新闻 — 东方财富（Eastmoney），过去7天
+机构面/媒体面信号。信息驱动，变动较慢，可信度较高。
+
+<start_of_news>
+{news_block}
+<end_of_news>
+
+### ② 东方财富股吧帖子 — 散户社交讨论
+东方财富股吧是中国最活跃的A股散户讨论社区，等同于海外的 StockTwits。
+帖子的阅读数（阅读量）和回复数（评论数）反映散户关注度和讨论热度。
+作者名为"XXX资讯"等官方账号的帖子属于机构/媒体性质，与散户帖子应区分分析。
+
+<start_of_guba>
+{guba_block}
+<end_of_guba>
+
+### ③ 境外社交平台（Reddit / StockTwits 等）
+**说明：** A股（{ticker}）在 Reddit / StockTwits 等境外散户社区没有实质性讨论。
+这是 A 股的正常特征，并不代表情绪为空，而是说明该股的散户情绪应完全从国内平台（如股吧）获取。
+
+## 如何分析A股情绪数据（最佳实践）
+
+1. **以股吧帖子数量和阅读/回复比例衡量散户关注度。** 帖子数多、阅读量大说明关注度高；帖子少则说明市场对该股的情绪覆盖稀薄。
+
+2. **区分机构/媒体帖子与散户帖子。** 作者名含"资讯""新闻""研报"等字样的帖子为机构内容；个人用户名的帖子为真正散户声音。
+
+3. **寻找新闻与股吧情绪的背离。** 如果新闻面利好但股吧讨论冷淡（甚至没有散户帖子），说明散户尚未跟进；反之则需要警惕追高风险。
+
+4. **从帖子标题识别主导叙事。** 反复出现的关键词（如"业绩预增""涨停""国产替代"等）即为当前主导情绪主题。
+
+5. **对数据缺口保持诚实。** 若股吧没有帖子，或新闻为空，应明确指出置信度较低，并说明原因。不要凭空捏造情绪信号。
+
+6. **结合催化剂和风险。** 是否出现业绩预告、重大合同、政策利好/利空、高管变动等可能驱动股价的事件。
+
+## 输出字段
+
+Fill the following fields:
+- **overall_band**: Exactly one of Bullish / Mildly Bullish / Neutral / Mixed / Mildly Bearish / Bearish. Use Mixed when sources point in clearly different directions; Neutral only when all sources are genuinely silent.
+- **overall_score**: A number from 0 (maximally bearish) to 10 (maximally bullish); 5 is neutral. Keep it consistent with overall_band.
+- **confidence**: low / medium / high, based on data quality and sample size.
+- **narrative**: Full source-by-source breakdown (East Money news, Guba posts), divergences, dominant narrative themes, catalysts and risks, and a markdown summary table of key sentiment signals (direction, source, supporting evidence). Write the narrative in Chinese as this is an A-share analysis.
+
+{get_language_instruction()}"""
 
 
 def _build_system_message(

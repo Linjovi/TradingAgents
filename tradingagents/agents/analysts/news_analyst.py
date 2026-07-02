@@ -8,6 +8,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_news,
     get_prediction_markets,
 )
+from tradingagents.dataflows.symbol_utils import is_cn_a_share
 
 
 def create_news_analyst(llm):
@@ -15,6 +16,7 @@ def create_news_analyst(llm):
         current_date = state["trade_date"]
         asset_type = state.get("asset_type", "stock")
         asset_label = "company" if asset_type == "stock" else "asset"
+        ticker = state.get("company_of_interest", "")
         instrument_context = get_instrument_context_from_state(state)
 
         tools = [
@@ -24,11 +26,35 @@ def create_news_analyst(llm):
             get_prediction_markets,
         ]
 
-        system_message = (
-            f"You are a news researcher tasked with analyzing recent news and trends over the past week. Please write a comprehensive report of the current state of the world that is relevant for trading and macroeconomics. Use the available tools: get_news(query, start_date, end_date) for {asset_label}-specific or targeted news searches, get_global_news(curr_date, look_back_days, limit) for broader macroeconomic news, get_macro_indicators(indicator, curr_date, look_back_days) to ground macro commentary in actual data from FRED (e.g. 'cpi', 'core_pce', 'unemployment', 'fed_funds_rate', '10y_treasury', 'yield_curve'), and get_prediction_markets(topic, limit) for live market-implied probabilities of forward-looking events (e.g. 'Fed rate cut', 'recession 2026', geopolitical or sector events). Provide specific, actionable insights with supporting evidence to help traders make informed decisions."
-            + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
-            + get_language_instruction()
-        )
+        if is_cn_a_share(ticker):
+            # A股专用：引导 LLM 使用中国宏观关键词并关注 A 股市场环境
+            cn_macro_guidance = (
+                " **Special guidance for A-share analysis:** "
+                "This is a Chinese A-share stock. When calling get_global_news(), "
+                "prioritise queries in Chinese covering: "
+                "中国人民银行货币政策（PBOC policy）, "
+                "A股市场行情（A-share market dynamics）, "
+                "中国GDP/PMI/工业数据（China macro data）, "
+                "产业政策与补贴（industrial policy & subsidies）, "
+                "中美贸易与关税（US-China trade）. "
+                "For get_macro_indicators(), note that FRED data covers US indicators; "
+                "supplement with Polymarket prediction markets for China-specific "
+                "events (e.g. 'China GDP growth', 'China rate cut', 'China trade'). "
+                "When discussing macro environment, give primary weight to China's "
+                "domestic policy cycle and industrial trends over US Fed policy."
+            )
+            system_message = (
+                f"You are a news researcher tasked with analyzing recent news and trends over the past week. Please write a comprehensive report of the current state of the world that is relevant for trading and macroeconomics. Use the available tools: get_news(query, start_date, end_date) for {asset_label}-specific or targeted news searches, get_global_news(curr_date, look_back_days, limit) for broader macroeconomic news, get_macro_indicators(indicator, curr_date, look_back_days) to ground macro commentary in actual data from FRED (e.g. 'cpi', 'core_pce', 'unemployment', 'fed_funds_rate', '10y_treasury', 'yield_curve'), and get_prediction_markets(topic, limit) for live market-implied probabilities of forward-looking events (e.g. 'Fed rate cut', 'recession 2026', geopolitical or sector events). Provide specific, actionable insights with supporting evidence to help traders make informed decisions."
+                + cn_macro_guidance
+                + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
+                + get_language_instruction()
+            )
+        else:
+            system_message = (
+                f"You are a news researcher tasked with analyzing recent news and trends over the past week. Please write a comprehensive report of the current state of the world that is relevant for trading and macroeconomics. Use the available tools: get_news(query, start_date, end_date) for {asset_label}-specific or targeted news searches, get_global_news(curr_date, look_back_days, limit) for broader macroeconomic news, get_macro_indicators(indicator, curr_date, look_back_days) to ground macro commentary in actual data from FRED (e.g. 'cpi', 'core_pce', 'unemployment', 'fed_funds_rate', '10y_treasury', 'yield_curve'), and get_prediction_markets(topic, limit) for live market-implied probabilities of forward-looking events (e.g. 'Fed rate cut', 'recession 2026', geopolitical or sector events). Provide specific, actionable insights with supporting evidence to help traders make informed decisions."
+                + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
+                + get_language_instruction()
+            )
 
         prompt = ChatPromptTemplate.from_messages(
             [
