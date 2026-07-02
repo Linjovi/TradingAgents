@@ -370,7 +370,8 @@ class TradingAgentsGraph:
             save_path = (
                 Path(self.config["results_dir"])
                 / "reports"
-                / f"{safe_ticker_component(ticker)}_{stamp}"
+                / safe_ticker_component(ticker)
+                / stamp
             )
         return write_report_tree(final_state, ticker, save_path)
 

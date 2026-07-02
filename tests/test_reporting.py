@@ -46,5 +46,6 @@ def test_save_reports_defaults_under_results_dir(tmp_path):
     mock_self = SimpleNamespace(config={"results_dir": str(tmp_path)})
     out = TradingAgentsGraph.save_reports(mock_self, _state(), "AAPL")
     assert out.exists()
-    assert out.parent.parent.name == "reports"  # results_dir/reports/AAPL_<stamp>/...
-    assert out.parent.name.startswith("AAPL_")
+    assert out.parent.parent.parent.name == "reports"  # results_dir/reports/AAPL/<stamp>/...
+    assert out.parent.parent.name == "AAPL"
+    assert out.parent.name.startswith("20")
