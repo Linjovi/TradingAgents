@@ -11,6 +11,7 @@ import http.client
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -29,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 _API_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 _UA = "tradingagents/0.2 (+https://github.com/TauricResearch/TradingAgents)"
+_MXDS_MCP_URL = "https://mxapi.eastmoney.com/mxds/mcp"
+_MCP_PROTOCOL_VERSION = "2025-06-18"
+_DATE_COLUMN_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 
 def _secid(ticker: str) -> str:
@@ -80,6 +84,382 @@ def _klines_to_dataframe(klines: list[str]) -> pd.DataFrame:
     df = df.set_index("Date")
     df.index.name = "Date"
     return df[["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
+
+
+def _first_present(row: dict, names: tuple[str, ...]):
+    for name in names:
+        if name in row:
+            return row[name]
+    return None
+
+
+def _parse_mxds_number(value) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if value is None:
+        raise ValueError("missing numeric value")
+    text = str(value).replace(",", "").strip()
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    if not match:
+        raise ValueError(f"not a number: {value!r}")
+    number = float(match.group(0))
+    if "亿" in text:
+        number *= 100_000_000
+    elif "万" in text:
+        number *= 10_000
+    return number
+
+
+def _mxds_sheet_to_rows(sheet: dict) -> list[dict]:
+    columns = sheet.get("columns") or []
+    items = sheet.get("items") or []
+    if len(columns) < 2 or not isinstance(items, list):
+        return []
+
+    date_columns: list[tuple[int, pd.Timestamp]] = []
+    for idx, column in enumerate(columns[1:], start=1):
+        match = _DATE_COLUMN_RE.search(str(column))
+        if match:
+            date_columns.append((idx, pd.to_datetime(match.group(1), errors="raise")))
+    if not date_columns:
+        return []
+
+    field_map = {
+        "开盘": "Open",
+        "开盘价": "Open",
+        "最高": "High",
+        "最高价": "High",
+        "最低": "Low",
+        "最低价": "Low",
+        "收盘": "Close",
+        "收盘价": "Close",
+        "成交量": "Volume",
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume",
+    }
+    rows_by_date = {
+        date: {"Date": date}
+        for _, date in date_columns
+    }
+    for item in items:
+        if not isinstance(item, list) or len(item) < 2:
+            continue
+        label = str(item[0]).strip()
+        field = field_map.get(label) or field_map.get(label.lower())
+        if field is None:
+            continue
+        for idx, date in date_columns:
+            if idx >= len(item):
+                continue
+            try:
+                value = _parse_mxds_number(item[idx])
+            except ValueError:
+                continue
+            rows_by_date[date][field] = int(value) if field == "Volume" else value
+
+    rows = []
+    for row in rows_by_date.values():
+        if {"Open", "High", "Low", "Close", "Volume"} <= row.keys():
+            row["Adj Close"] = row["Close"]
+            rows.append(row)
+    return rows
+
+
+def _mxds_rows_to_dataframe(rows: list) -> pd.DataFrame:
+    """Convert MXDS MCP OHLCV rows to a Yahoo-like OHLCV DataFrame."""
+    normalized = []
+    for row in rows:
+        if isinstance(row, str):
+            parsed = _klines_to_dataframe([row])
+            if not parsed.empty:
+                normalized.append(parsed.reset_index().iloc[0].to_dict())
+            continue
+        if not isinstance(row, dict):
+            continue
+
+        try:
+            date = pd.to_datetime(
+                _first_present(row, ("date", "Date", "trade_date", "tradeDate", "日期")),
+                errors="raise",
+            )
+            open_ = _parse_mxds_number(_first_present(row, ("open", "Open", "开盘", "开盘价")))
+            close = _parse_mxds_number(_first_present(row, ("close", "Close", "收盘", "收盘价", "latest")))
+            high = _parse_mxds_number(_first_present(row, ("high", "High", "最高", "最高价")))
+            low = _parse_mxds_number(_first_present(row, ("low", "Low", "最低", "最低价")))
+            volume = int(_parse_mxds_number(_first_present(row, ("volume", "Volume", "成交量", "vol"))))
+        except (TypeError, ValueError):
+            continue
+        normalized.append(
+            {
+                "Date": date,
+                "Open": open_,
+                "High": high,
+                "Low": low,
+                "Close": close,
+                "Adj Close": close,
+                "Volume": volume,
+            }
+        )
+
+    df = pd.DataFrame(normalized)
+    if df.empty:
+        return df
+    df = df.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
+    df = df.set_index("Date")
+    df.index.name = "Date"
+    return df[["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
+
+
+def _parse_mcp_response_body(body: bytes) -> dict:
+    text = body.decode("utf-8", errors="replace").strip()
+    if not text:
+        return {}
+    if text.startswith("data:"):
+        chunks = []
+        for line in text.splitlines():
+            if line.startswith("data:"):
+                chunks.append(line.removeprefix("data:").strip())
+        text = "\n".join(chunks).strip()
+    return json.loads(text)
+
+
+def _mxds_mcp_request(
+    method: str,
+    params: dict | None,
+    api_key: str,
+    *,
+    session_id: str | None = None,
+    timeout: float = 20.0,
+    expect_response: bool = True,
+) -> tuple[dict, str | None]:
+    request_id = 1 if expect_response else None
+    body = {"jsonrpc": "2.0", "method": method}
+    if request_id is not None:
+        body["id"] = request_id
+    if params is not None:
+        body["params"] = params
+
+    headers = {
+        "User-Agent": _UA,
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "em_api_key": api_key,
+    }
+    if session_id:
+        headers["mcp-session-id"] = session_id
+
+    req = Request(
+        os.getenv("MXDS_MCP_URL", _MXDS_MCP_URL),
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        new_session_id = resp.headers.get("mcp-session-id") or session_id
+        if resp.status == 202 or not expect_response:
+            return {}, new_session_id
+        payload = _parse_mcp_response_body(resp.read())
+    if payload.get("error"):
+        raise NoMarketDataError("MXDS", "MXDS", str(payload["error"]))
+    return payload.get("result") or payload, new_session_id
+
+
+def _mxds_initialize(api_key: str, timeout: float) -> str | None:
+    result, session_id = _mxds_mcp_request(
+        "initialize",
+        {
+            "protocolVersion": _MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "tradingagents", "version": "0.3.0"},
+        },
+        api_key,
+        timeout=timeout,
+    )
+    session_id = session_id or result.get("sessionId")
+    try:
+        _mxds_mcp_request(
+            "notifications/initialized",
+            {},
+            api_key,
+            session_id=session_id,
+            timeout=timeout,
+            expect_response=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - notification support varies by MCP gateway
+        logger.debug("MXDS MCP initialized notification failed: %s", exc)
+    return session_id
+
+
+def _mxds_tool_score(tool: dict) -> int:
+    text = " ".join(
+        str(tool.get(key, "")) for key in ("name", "title", "description")
+    ).lower()
+    score = 0
+    if "ashare" in text or "a股" in text:
+        score += 10
+    if "stock" in text or "股票" in text:
+        score += 4
+    for needle in ("kline", "k-line", "ohlcv", "历史", "k线", "日线", "行情"):
+        if needle in text:
+            score += 2
+    if "宏观" in text or "macro" in text:
+        score -= 6
+    for needle in ("fund", "资金", "report", "研报", "news", "新闻"):
+        if needle in text:
+            score -= 2
+    return score
+
+
+def _choose_mxds_kline_tool(tools: list[dict]) -> dict:
+    candidates = sorted(tools, key=_mxds_tool_score, reverse=True)
+    if not candidates or _mxds_tool_score(candidates[0]) <= 0:
+        raise NoMarketDataError("MXDS", "MXDS", "MXDS MCP has no recognizable K-line tool")
+    return candidates[0]
+
+
+def _format_mxds_date(date: str, compact: bool) -> str:
+    parsed = datetime.strptime(date, "%Y-%m-%d")
+    return parsed.strftime("%Y%m%d" if compact else "%Y-%m-%d")
+
+
+def _mxds_query(symbol: str, start_date: str, end_date: str) -> str:
+    code, _, suffix = symbol.strip().upper().partition(".")
+    exchange = {"SS": "SH", "SZ": "SZ", "BJ": "BJ"}.get(suffix, suffix)
+    display_symbol = f"{code}.{exchange}" if exchange else code
+    return (
+        f"查询A股{display_symbol}从{start_date}到{end_date}每个交易日的日K线数据，"
+        "必须逐日返回日期、每日开盘价、每日最高价、每日最低价、每日收盘价、每日成交量"
+    )
+
+
+def _mxds_tool_arguments(tool: dict, symbol: str, start_date: str, end_date: str) -> dict:
+    schema = tool.get("inputSchema") or tool.get("input_schema") or {}
+    props = schema.get("properties") or {}
+    args = {}
+    code, _, suffix = symbol.strip().upper().partition(".")
+
+    for name, meta in props.items():
+        lowered = name.lower()
+        description = str(meta.get("description", "")).lower() if isinstance(meta, dict) else ""
+        compact_date = "yyyymmdd" in lowered or "yyyymmdd" in description or lowered in {"beg", "end"}
+        if lowered == "query":
+            args[name] = _mxds_query(symbol, start_date, end_date)
+        elif lowered in {"symbol", "ticker"} or "股票代码" in description:
+            args[name] = symbol.upper()
+        elif lowered in {"code", "stock_code", "stockcode"}:
+            args[name] = code
+        elif lowered == "secid":
+            args[name] = _secid(symbol)
+        elif lowered in {"market", "exchange"}:
+            args[name] = suffix or ("SH" if code.startswith("6") else "SZ")
+        elif lowered in {"start", "start_date", "startdate", "beg", "begin_date", "begindate"}:
+            args[name] = _format_mxds_date(start_date, compact_date)
+        elif lowered in {"end", "end_date", "enddate"}:
+            args[name] = _format_mxds_date(end_date, compact_date)
+        elif lowered in {"period", "klt", "freq", "frequency"}:
+            args[name] = 101
+        elif lowered in {"adjust", "adjust_type", "fqt", "fq"}:
+            args[name] = 1
+        elif lowered in {"limit", "lmt", "count", "size"}:
+            args[name] = 1000000
+
+    return args
+
+
+def _json_loads_maybe(value):
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{":
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+
+
+def _is_mxds_row_like(value) -> bool:
+    if isinstance(value, str):
+        return bool(re.match(r"^\d{4}-\d{2}-\d{2},", value.strip()))
+    if not isinstance(value, dict):
+        return False
+    lowered_keys = {str(key).lower() for key in value}
+    return (
+        {"date", "open", "close", "high", "low"} <= lowered_keys
+        or {"日期", "开盘", "收盘", "最高", "最低"} <= set(value)
+    )
+
+
+def _extract_mxds_rows(value) -> list:
+    value = _json_loads_maybe(value)
+    if isinstance(value, list):
+        if value and all(_is_mxds_row_like(item) for item in value):
+            return value
+        for item in value:
+            rows = _extract_mxds_rows(item)
+            if rows:
+                return rows
+    if isinstance(value, dict):
+        if "columns" in value and "items" in value:
+            return _mxds_sheet_to_rows(value)
+        if value.get("type") == "text" and "text" in value:
+            rows = _extract_mxds_rows(value["text"])
+            if rows:
+                return rows
+        for key in ("klines", "kline", "rows", "data", "items", "result", "records", "list"):
+            if key in value:
+                rows = _extract_mxds_rows(value[key])
+                if rows:
+                    return rows
+        if _is_mxds_row_like(value):
+            return [value]
+        if "content" in value:
+            rows = _extract_mxds_rows(value["content"])
+            if rows:
+                return rows
+    return []
+
+
+def _fetch_mxds_mcp_ohlcv(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    *,
+    timeout: float = 20.0,
+) -> pd.DataFrame:
+    """Fetch daily A-share OHLCV through Eastmoney MXDS MCP."""
+    api_key = os.getenv("EM_API_KEY", "").strip()
+    if not api_key:
+        raise NoMarketDataError(ticker, ticker, "MXDS MCP is not configured; set EM_API_KEY")
+
+    session_id = _mxds_initialize(api_key, timeout)
+    tools_result, session_id = _mxds_mcp_request(
+        "tools/list",
+        {},
+        api_key,
+        session_id=session_id,
+        timeout=timeout,
+    )
+    tool = _choose_mxds_kline_tool(tools_result.get("tools") or [])
+    call_result, _ = _mxds_mcp_request(
+        "tools/call",
+        {
+            "name": tool["name"],
+            "arguments": _mxds_tool_arguments(tool, ticker, start_date, end_date),
+        },
+        api_key,
+        session_id=session_id,
+        timeout=timeout,
+    )
+    rows = _extract_mxds_rows(call_result)
+    df = _mxds_rows_to_dataframe(rows)
+    if df.empty:
+        raise NoMarketDataError(ticker, ticker, "MXDS MCP returned no OHLCV rows")
+    _assert_ohlcv_not_stale(df, end_date, ticker, ticker)
+    return df
 
 
 def _fetch_eastmoney_klines(
@@ -164,6 +544,20 @@ def load_eastmoney_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
         cached = pd.read_csv(data_file, on_bad_lines="skip", encoding="utf-8")
         if not cached.empty and "Close" in cached.columns:
             data = cached
+
+    if data is None and os.getenv("EM_API_KEY", "").strip():
+        try:
+            downloaded = _fetch_mxds_mcp_ohlcv(symbol, start_str, end_str).reset_index()
+            downloaded.to_csv(data_file, index=False, encoding="utf-8")
+            data = downloaded
+        except (
+            NoMarketDataError,
+            HTTPError,
+            OSError,
+            http.client.HTTPException,
+            json.JSONDecodeError,
+        ) as exc:
+            logger.warning("MXDS MCP OHLCV fetch failed for %s: %s", symbol, exc)
 
     if data is None:
         downloaded = _fetch_eastmoney_klines(symbol, start_str, end_str).reset_index()
