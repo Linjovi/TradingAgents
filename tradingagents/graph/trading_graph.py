@@ -32,7 +32,7 @@ from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_llm_client
-from tradingagents.reporting import write_report_tree
+from tradingagents.reporting import report_directory_component, write_report_tree
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
 from .conditional_logic import ConditionalLogic
@@ -370,7 +370,7 @@ class TradingAgentsGraph:
             save_path = (
                 Path(self.config["results_dir"])
                 / "reports"
-                / safe_ticker_component(ticker)
+                / report_directory_component(ticker)
                 / stamp
             )
         return write_report_tree(final_state, ticker, save_path)

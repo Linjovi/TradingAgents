@@ -2,11 +2,12 @@
 programmatic API alike (#1037)."""
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
-from tradingagents.reporting import write_report_tree
+from tradingagents.reporting import report_directory_component, write_report_tree
 
 
 def _state():
@@ -44,8 +45,30 @@ def test_save_reports_explicit_path(tmp_path):
 @pytest.mark.unit
 def test_save_reports_defaults_under_results_dir(tmp_path):
     mock_self = SimpleNamespace(config={"results_dir": str(tmp_path)})
-    out = TradingAgentsGraph.save_reports(mock_self, _state(), "AAPL")
+    with patch(
+        "tradingagents.reporting.resolve_instrument_identity",
+        return_value={"company_name": "工业富联"},
+    ):
+        out = TradingAgentsGraph.save_reports(mock_self, _state(), "601138.SS")
     assert out.exists()
-    assert out.parent.parent.parent.name == "reports"  # results_dir/reports/AAPL/<stamp>/...
-    assert out.parent.parent.name == "AAPL"
+    assert out.parent.parent.parent.name == "reports"  # results_dir/reports/工业富联/<stamp>/...
+    assert out.parent.parent.name == "工业富联"
     assert out.parent.name.startswith("20")
+
+
+@pytest.mark.unit
+def test_report_directory_component_prefers_resolved_company_name():
+    with patch(
+        "tradingagents.reporting.resolve_instrument_identity",
+        return_value={"company_name": "工业富联"},
+    ):
+        assert report_directory_component("601138.SS") == "工业富联"
+
+
+@pytest.mark.unit
+def test_report_directory_component_sanitizes_resolved_company_name():
+    with patch(
+        "tradingagents.reporting.resolve_instrument_identity",
+        return_value={"company_name": "工业/富联:AI\n服务器"},
+    ):
+        assert report_directory_component("601138.SS") == "工业_富联_AI_服务器"

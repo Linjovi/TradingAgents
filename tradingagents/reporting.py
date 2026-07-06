@@ -6,8 +6,43 @@ CLI and ``TradingAgentsGraph.save_reports`` both call this, so a headless / API
 run produces the same on-disk report tree a CLI run does.
 """
 
+import re
 from datetime import datetime
 from pathlib import Path
+
+from tradingagents.dataflows.utils import safe_ticker_component
+
+
+_INVALID_REPORT_COMPONENT_RE = re.compile(r"[\x00-\x1f\x7f/\\:]+")
+
+
+def resolve_instrument_identity(ticker: str) -> dict:
+    """Resolve ticker identity lazily so importing reporting stays lightweight."""
+    from tradingagents.agents.utils.agent_utils import resolve_instrument_identity as resolver
+
+    return resolver(ticker)
+
+
+def _safe_report_component(value: str | None, *, max_len: int = 80) -> str | None:
+    """Return a readable, single-directory component or None when unusable."""
+    if not isinstance(value, str):
+        return None
+
+    cleaned = _INVALID_REPORT_COMPONENT_RE.sub("_", value.strip())
+    cleaned = re.sub(r"_+", "_", cleaned).strip(" ._")
+    if not cleaned or set(cleaned) == {"."}:
+        return None
+
+    return cleaned[:max_len].rstrip(" ._") or None
+
+
+def report_directory_component(ticker: str) -> str:
+    """Prefer the resolved Chinese/company name for report folders, fallback to ticker."""
+    identity = resolve_instrument_identity(ticker)
+    company_name = _safe_report_component(identity.get("company_name"))
+    if company_name:
+        return company_name
+    return safe_ticker_component(ticker)
 
 
 def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:
