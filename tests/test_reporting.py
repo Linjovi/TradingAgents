@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 import pytest
 
-from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.reporting import report_directory_component, write_report_tree
 
 
@@ -35,7 +34,27 @@ def test_write_report_tree_creates_files(tmp_path):
 
 
 @pytest.mark.unit
+def test_write_report_tree_creates_html_companion(tmp_path):
+    out = write_report_tree(
+        {
+            "market_report": "Market **strong** signal",
+            "news_report": "Use <raw> safely",
+        },
+        "AAPL",
+        tmp_path,
+    )
+
+    html = (tmp_path / "complete_report.html").read_text()
+    assert out == tmp_path / "complete_report.md"
+    assert "<h1>Trading Analysis Report: AAPL</h1>" in html
+    assert "<strong>strong</strong>" in html
+    assert "&lt;raw&gt;" in html
+
+
+@pytest.mark.unit
 def test_save_reports_explicit_path(tmp_path):
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
     # Unbound: with an explicit save_path, the method doesn't touch self/config.
     out = TradingAgentsGraph.save_reports(None, _state(), "AAPL", save_path=tmp_path)
     assert (tmp_path / "complete_report.md").exists()
@@ -44,6 +63,8 @@ def test_save_reports_explicit_path(tmp_path):
 
 @pytest.mark.unit
 def test_save_reports_defaults_under_results_dir(tmp_path):
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
     mock_self = SimpleNamespace(config={"results_dir": str(tmp_path)})
     with patch(
         "tradingagents.reporting.resolve_instrument_identity",
