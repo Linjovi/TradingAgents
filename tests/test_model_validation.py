@@ -4,7 +4,7 @@ import warnings
 import pytest
 
 from tradingagents.llm_clients.base_client import BaseLLMClient
-from tradingagents.llm_clients.model_catalog import get_known_models
+from tradingagents.llm_clients.model_catalog import get_known_models, get_model_options
 from tradingagents.llm_clients.validators import validate_model
 
 
@@ -53,3 +53,7 @@ class ModelValidationTests(unittest.TestCase):
                     client.get_llm()
 
                 self.assertEqual(caught, [])
+
+    def test_mimo_model_options_are_mode_specific(self):
+        self.assertEqual(get_model_options("mimo", "quick")[0][1], "mimo-v2.5")
+        self.assertEqual(get_model_options("mimo", "deep")[0][1], "mimo-v2.5-pro")

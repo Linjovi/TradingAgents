@@ -50,6 +50,7 @@ from tradingagents.graph.analyst_execution import (
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.reporting import report_directory_component, write_report_tree
+from tradingagents.dataflows.errors import VendorError
 
 console = Console()
 
@@ -64,6 +65,21 @@ if sys.platform == "win32":  # pragma: no cover - platform dependent
     _NO_CONSOLE_ERRORS: tuple[type[BaseException], ...] = (NoConsoleScreenBufferError,)
 else:
     _NO_CONSOLE_ERRORS = ()
+
+
+def _find_vendor_error(exc: BaseException) -> VendorError | None:
+    """Return the first vendor-data error hidden in an exception chain."""
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, VendorError):
+            return current
+        pending.extend((current.__cause__, current.__context__))
+    return None
 
 app = typer.Typer(
     name="TradingAgents",
@@ -1311,6 +1327,11 @@ def analyze(
             err=True,
         )
         raise typer.Exit(code=1) from None
+    except Exception as exc:
+        if vendor_error := _find_vendor_error(exc):
+            typer.echo(f"Market data unavailable: {vendor_error}", err=True)
+            raise typer.Exit(code=1) from None
+        raise
 
 
 if __name__ == "__main__":

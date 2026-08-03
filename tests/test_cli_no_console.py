@@ -11,6 +11,7 @@ import sys
 from typer.testing import CliRunner
 
 import cli.main as m
+from tradingagents.dataflows.errors import NoMarketDataError
 
 
 def test_no_console_error_tuple_matches_platform():
@@ -55,3 +56,21 @@ def test_unrelated_errors_still_propagate(monkeypatch):
     monkeypatch.setattr(m, "run_analysis", _boom)
     result = CliRunner().invoke(m.app, [])
     assert isinstance(result.exception, ValueError)
+
+
+def test_market_data_error_prints_reason_without_traceback(monkeypatch):
+    def _boom(*a, **k):
+        cause = NoMarketDataError(
+            "603296.SS",
+            "603296.SS",
+            "Eastmoney error: Remote end closed connection without response",
+        )
+        raise RuntimeError("graph failed") from cause
+
+    monkeypatch.setattr(m, "run_analysis", _boom)
+    result = CliRunner().invoke(m.app, [])
+
+    assert result.exit_code == 1
+    assert "No market data for '603296.SS'" in result.output
+    assert "Remote end closed connection without response" in result.output
+    assert "Traceback" not in result.output

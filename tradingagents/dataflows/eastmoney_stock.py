@@ -30,9 +30,11 @@ logger = logging.getLogger(__name__)
 
 _API_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 _UA = "tradingagents/0.2 (+https://github.com/TauricResearch/TradingAgents)"
+_MX_DATA_API_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/query"
 _MXDS_MCP_URL = "https://mxapi.eastmoney.com/mxds/mcp"
 _MCP_PROTOCOL_VERSION = "2025-06-18"
 _DATE_COLUMN_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+_EASTMONEY_KLINE_RETRIES = 3
 
 
 def _secid(ticker: str) -> str:
@@ -423,41 +425,122 @@ def _extract_mxds_rows(value) -> list:
     return []
 
 
-def _fetch_mxds_mcp_ohlcv(
+def _mx_data_label(key: str, name_map: dict, code_map: dict) -> str:
+    mapped = name_map.get(key)
+    if mapped is None and key.isdigit():
+        mapped = name_map.get(int(key))
+    if mapped not in (None, ""):
+        return str(mapped)
+    mapped = code_map.get(key)
+    if mapped not in (None, ""):
+        return str(mapped)
+    return key
+
+
+def _mx_data_field(label: str) -> str | None:
+    normalized = label.strip().lower()
+    if "成交量" in normalized or normalized in {"volume", "vol"}:
+        return "成交量"
+    if "开盘" in normalized or normalized == "open":
+        return "开盘"
+    if "最高" in normalized or normalized == "high":
+        return "最高"
+    if "最低" in normalized or normalized == "low":
+        return "最低"
+    if "收盘" in normalized or normalized in {"close", "latest"}:
+        return "收盘"
+    return None
+
+
+def _mx_data_code_map(block: dict) -> dict[str, str]:
+    for key in ("returnCodeMap", "returnCodeNameMap", "codeMap"):
+        value = block.get(key)
+        if isinstance(value, dict):
+            return {str(k): str(v) for k, v in value.items()}
+    return {}
+
+
+def _extract_mx_data_rows(result: dict) -> list[dict]:
+    """Extract OHLCV-like rows from the MX data skill API response."""
+    data = result.get("data") or {}
+    inner_data = data.get("data") or {}
+    search_result = inner_data.get("searchDataResultDTO") or {}
+    dto_list = search_result.get("dataTableDTOList") or []
+    rows: list[dict] = []
+
+    for dto in dto_list:
+        if not isinstance(dto, dict):
+            continue
+        table = dto.get("table") or {}
+        if not isinstance(table, dict):
+            continue
+        dates = table.get("headName") or []
+        if not isinstance(dates, list) or not dates:
+            continue
+        date_labels = [str(date)[:10] for date in dates]
+        name_map = dto.get("nameMap") or {}
+        if isinstance(name_map, list):
+            name_map = {str(i): value for i, value in enumerate(name_map)}
+        elif not isinstance(name_map, dict):
+            name_map = {}
+        code_map = _mx_data_code_map(dto)
+        by_date = [{"日期": date} for date in date_labels]
+
+        for key, values in table.items():
+            if key == "headName":
+                continue
+            field = _mx_data_field(_mx_data_label(str(key), name_map, code_map))
+            if field is None:
+                continue
+            if not isinstance(values, list):
+                values = [values]
+            for idx, value in enumerate(values[:len(by_date)]):
+                by_date[idx][field] = value
+
+        rows.extend(
+            row
+            for row in by_date
+            if {"日期", "开盘", "收盘", "最高", "最低", "成交量"} <= set(row)
+        )
+
+    return rows
+
+
+def _fetch_mx_data_ohlcv(
     ticker: str,
     start_date: str,
     end_date: str,
     *,
-    timeout: float = 20.0,
+    timeout: float = 30.0,
 ) -> pd.DataFrame:
-    """Fetch daily A-share OHLCV through Eastmoney MXDS MCP."""
-    api_key = os.getenv("EM_API_KEY", "").strip()
+    """Fetch daily A-share OHLCV through the Eastmoney MX data skill API."""
+    api_key = os.getenv("MX_APIKEY", "").strip()
     if not api_key:
-        raise NoMarketDataError(ticker, ticker, "MXDS MCP is not configured; set EM_API_KEY")
+        raise NoMarketDataError(ticker, ticker, "MX data API is not configured; set MX_APIKEY")
 
-    session_id = _mxds_initialize(api_key, timeout)
-    tools_result, session_id = _mxds_mcp_request(
-        "tools/list",
-        {},
-        api_key,
-        session_id=session_id,
-        timeout=timeout,
-    )
-    tool = _choose_mxds_kline_tool(tools_result.get("tools") or [])
-    call_result, _ = _mxds_mcp_request(
-        "tools/call",
-        {
-            "name": tool["name"],
-            "arguments": _mxds_tool_arguments(tool, ticker, start_date, end_date),
+    req = Request(
+        os.getenv("MX_DATA_API_URL", _MX_DATA_API_URL),
+        data=json.dumps({"toolQuery": _mxds_query(ticker, start_date, end_date)}).encode("utf-8"),
+        headers={
+            "User-Agent": _UA,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "apikey": api_key,
         },
-        api_key,
-        session_id=session_id,
-        timeout=timeout,
+        method="POST",
     )
-    rows = _extract_mxds_rows(call_result)
+    with urlopen(req, timeout=timeout) as resp:
+        result = json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    status = result.get("status") if isinstance(result, dict) else None
+    if status != 0:
+        message = result.get("message", "unknown") if isinstance(result, dict) else "invalid response"
+        raise NoMarketDataError(ticker, ticker, f"MX data API error {status}: {message}")
+
+    rows = _extract_mx_data_rows(result)
     df = _mxds_rows_to_dataframe(rows)
     if df.empty:
-        raise NoMarketDataError(ticker, ticker, "MXDS MCP returned no OHLCV rows")
+        raise NoMarketDataError(ticker, ticker, "MX data API returned no OHLCV rows")
     _assert_ohlcv_not_stale(df, end_date, ticker, ticker)
     return df
 
@@ -494,27 +577,76 @@ def _fetch_eastmoney_klines(
             "Accept": "application/json, text/plain, */*",
         },
     )
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-    except HTTPError as exc:
-        logger.warning("Eastmoney OHLCV HTTP error %s for %s", exc.code, ticker)
-        raise NoMarketDataError(ticker, ticker, f"Eastmoney HTTP {exc.code}") from exc
-    except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
-        logger.warning("Eastmoney OHLCV fetch failed for %s: %s", ticker, exc)
-        raise NoMarketDataError(ticker, ticker, f"Eastmoney error: {exc}") from exc
+    max_attempts = _EASTMONEY_KLINE_RETRIES + 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except HTTPError as exc:
+            logger.warning(
+                "Eastmoney OHLCV HTTP error %s for %s (attempt %s/%s)",
+                exc.code,
+                ticker,
+                attempt,
+                max_attempts,
+            )
+            if attempt == max_attempts:
+                raise NoMarketDataError(ticker, ticker, f"Eastmoney HTTP {exc.code}") from exc
+            continue
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+            logger.warning(
+                "Eastmoney OHLCV fetch failed for %s (attempt %s/%s): %s",
+                ticker,
+                attempt,
+                max_attempts,
+                exc,
+            )
+            if attempt == max_attempts:
+                raise NoMarketDataError(ticker, ticker, f"Eastmoney error: {exc}") from exc
+            continue
 
-    klines = ((payload.get("data") or {}).get("klines") or []) if isinstance(payload, dict) else []
-    df = _klines_to_dataframe(klines)
-    if df.empty:
-        raise NoMarketDataError(ticker, ticker, f"Eastmoney returned no rows between {start_date} and {end_date}")
-    _assert_ohlcv_not_stale(df, end_date, ticker, ticker)
-    return df
+        klines = ((payload.get("data") or {}).get("klines") or []) if isinstance(payload, dict) else []
+        df = _klines_to_dataframe(klines)
+        if not df.empty:
+            _assert_ohlcv_not_stale(df, end_date, ticker, ticker)
+            return df
+
+        logger.warning(
+            "Eastmoney returned no OHLCV rows for %s between %s and %s (attempt %s/%s)",
+            ticker,
+            start_date,
+            end_date,
+            attempt,
+            max_attempts,
+        )
+
+    raise NoMarketDataError(ticker, ticker, f"Eastmoney returned no rows between {start_date} and {end_date}")
+
+
+def _fetch_preferred_eastmoney_ohlcv(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """Fetch A-share OHLCV from the preferred Eastmoney-backed source."""
+    mx_error: NoMarketDataError | None = None
+    if os.getenv("MX_APIKEY", "").strip():
+        try:
+            return _fetch_mx_data_ohlcv(symbol, start_date, end_date)
+        except NoMarketDataError as exc:
+            mx_error = exc
+            logger.warning("MX data OHLCV fetch failed for %s: %s", symbol, exc)
+        except (HTTPError, OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+            mx_error = NoMarketDataError(symbol, symbol, f"MX data API error: {exc}")
+            logger.warning("MX data OHLCV fetch failed for %s: %s", symbol, exc)
+
+    try:
+        return _fetch_eastmoney_klines(symbol, start_date, end_date)
+    except NoMarketDataError as exc:
+        if mx_error is not None:
+            raise mx_error from exc
+        raise
 
 
 def get_stock_data_eastmoney(symbol: str, start_date: str, end_date: str) -> str:
     """Return formatted A-share OHLCV data from Eastmoney."""
-    data = _fetch_eastmoney_klines(symbol, start_date, end_date)
+    data = _fetch_preferred_eastmoney_ohlcv(symbol, start_date, end_date)
     data = data.round({"Open": 2, "High": 2, "Low": 2, "Close": 2, "Adj Close": 2})
 
     header = f"# Stock data for {symbol.upper()} from {start_date} to {end_date} (source: Eastmoney)\n"
@@ -545,22 +677,8 @@ def load_eastmoney_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
         if not cached.empty and "Close" in cached.columns:
             data = cached
 
-    if data is None and os.getenv("EM_API_KEY", "").strip():
-        try:
-            downloaded = _fetch_mxds_mcp_ohlcv(symbol, start_str, end_str).reset_index()
-            downloaded.to_csv(data_file, index=False, encoding="utf-8")
-            data = downloaded
-        except (
-            NoMarketDataError,
-            HTTPError,
-            OSError,
-            http.client.HTTPException,
-            json.JSONDecodeError,
-        ) as exc:
-            logger.warning("MXDS MCP OHLCV fetch failed for %s: %s", symbol, exc)
-
     if data is None:
-        downloaded = _fetch_eastmoney_klines(symbol, start_str, end_str).reset_index()
+        downloaded = _fetch_preferred_eastmoney_ohlcv(symbol, start_str, end_str).reset_index()
         downloaded.to_csv(data_file, index=False, encoding="utf-8")
         data = downloaded
 

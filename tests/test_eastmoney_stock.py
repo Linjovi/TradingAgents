@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import http.client
+import json
 from unittest import mock
 
 import pandas as pd
@@ -29,6 +31,47 @@ def test_eastmoney_klines_parse_to_yfinance_like_frame():
 
 
 @pytest.mark.unit
+def test_eastmoney_klines_retries_transient_disconnect():
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    payload = {
+        "data": {
+            "klines": [
+                "2026-07-01,33.00,33.25,33.80,32.90,123456,410000000,2.70,1.22,0.40,3.50",
+            ]
+        }
+    }
+    response = mock.MagicMock()
+    response.__enter__.return_value.read.return_value = json.dumps(payload).encode("utf-8")
+
+    with mock.patch.object(
+        em,
+        "urlopen",
+        side_effect=[http.client.RemoteDisconnected("closed"), response],
+    ) as urlopen:
+        df = em._fetch_eastmoney_klines("002472.SZ", "2026-07-01", "2026-07-02")
+
+    assert df.loc[pd.Timestamp("2026-07-01"), "Close"] == 33.25
+    assert urlopen.call_count == 2
+
+
+@pytest.mark.unit
+def test_eastmoney_klines_raises_after_three_retries():
+    from tradingagents.dataflows import eastmoney_stock as em
+    from tradingagents.dataflows.errors import NoMarketDataError
+
+    with mock.patch.object(
+        em,
+        "urlopen",
+        side_effect=http.client.RemoteDisconnected("closed"),
+    ) as urlopen:
+        with pytest.raises(NoMarketDataError, match="Eastmoney error"):
+            em._fetch_eastmoney_klines("002472.SZ", "2026-07-01", "2026-07-02")
+
+    assert urlopen.call_count == 4
+
+
+@pytest.mark.unit
 def test_yfinance_stock_data_routes_a_share_to_eastmoney():
     import tradingagents.dataflows.y_finance as yfin
 
@@ -45,7 +88,38 @@ def test_yfinance_stock_data_routes_a_share_to_eastmoney():
 
 
 @pytest.mark.unit
+def test_get_stock_data_eastmoney_prefers_mx_data_when_api_key_configured(monkeypatch):
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    frame = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(["2026-07-01", "2026-07-02"]),
+            "Open": [33.0, 33.2],
+            "High": [33.8, 34.5],
+            "Low": [32.9, 33.1],
+            "Close": [33.25, 34.1],
+            "Adj Close": [33.25, 34.1],
+            "Volume": [123456, 234567],
+        }
+    ).set_index("Date")
+
+    monkeypatch.setenv("MX_APIKEY", "test-key")
+    with mock.patch.object(
+        em,
+        "_fetch_mx_data_ohlcv",
+        return_value=frame,
+    ) as mx_data_fetch, mock.patch.object(em, "_fetch_eastmoney_klines") as public_fetch:
+        result = em.get_stock_data_eastmoney("600276.SS", "2026-07-01", "2026-07-02")
+
+    assert "# Total records: 2" in result
+    assert "34.1" in result
+    mx_data_fetch.assert_called_once_with("600276.SS", "2026-07-01", "2026-07-02")
+    public_fetch.assert_not_called()
+
+
+@pytest.mark.unit
 def test_stockstats_load_ohlcv_routes_a_share_to_eastmoney_cache_loader(tmp_path):
+    from tradingagents.dataflows import eastmoney_stock as em
     from tradingagents.dataflows import stockstats_utils as su
     from tradingagents.dataflows.config import set_config
 
@@ -62,7 +136,7 @@ def test_stockstats_load_ohlcv_routes_a_share_to_eastmoney_cache_loader(tmp_path
 
     set_config({"data_cache_dir": str(tmp_path)})
     with mock.patch.object(
-        su,
+        em,
         "load_eastmoney_ohlcv",
         return_value=frame,
     ) as eastmoney_loader, mock.patch.object(su.yf, "download") as yf_download:
@@ -74,7 +148,7 @@ def test_stockstats_load_ohlcv_routes_a_share_to_eastmoney_cache_loader(tmp_path
 
 
 @pytest.mark.unit
-def test_load_eastmoney_ohlcv_prefers_mxds_mcp_when_api_key_configured(tmp_path, monkeypatch):
+def test_load_eastmoney_ohlcv_prefers_mx_data_when_api_key_configured(tmp_path, monkeypatch):
     from tradingagents.dataflows import eastmoney_stock as em
     from tradingagents.dataflows.config import set_config
 
@@ -91,18 +165,60 @@ def test_load_eastmoney_ohlcv_prefers_mxds_mcp_when_api_key_configured(tmp_path,
     )
 
     set_config({"data_cache_dir": str(tmp_path)})
-    monkeypatch.setenv("EM_API_KEY", "test-key")
+    monkeypatch.setenv("MX_APIKEY", "test-key")
     with mock.patch.object(
         em,
-        "_fetch_mxds_mcp_ohlcv",
+        "_fetch_mx_data_ohlcv",
         return_value=frame.set_index("Date"),
-    ) as mcp_fetch, mock.patch.object(em, "_fetch_eastmoney_klines") as public_fetch:
+    ) as mx_data_fetch, mock.patch.object(em, "_fetch_eastmoney_klines") as public_fetch:
         result = em.load_eastmoney_ohlcv("601138.SS", "2026-07-02")
 
     assert len(result) == 2
     assert result.iloc[-1]["Close"] == 34.1
-    mcp_fetch.assert_called_once()
+    mx_data_fetch.assert_called_once()
     public_fetch.assert_not_called()
+
+
+@pytest.mark.unit
+def test_mx_data_response_parse_to_yfinance_like_frame():
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    result = {
+        "status": 0,
+        "data": {
+            "data": {
+                "searchDataResultDTO": {
+                    "dataTableDTOList": [
+                        {
+                            "entityName": "比亚迪",
+                            "table": {
+                                "headName": ["2026-07-01", "2026-07-02"],
+                                "1": [33.0, 33.2],
+                                "2": [33.8, 34.5],
+                                "3": [32.9, 33.1],
+                                "4": [33.25, 34.1],
+                                "5": [123456, 234567],
+                            },
+                            "nameMap": {
+                                "1": "开盘价",
+                                "2": "最高价",
+                                "3": "最低价",
+                                "4": "收盘价",
+                                "5": "成交量",
+                            },
+                        }
+                    ]
+                }
+            }
+        },
+    }
+
+    df = em._mxds_rows_to_dataframe(em._extract_mx_data_rows(result))
+
+    assert list(df.columns) == ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+    assert df.loc[pd.Timestamp("2026-07-01"), "Open"] == 33.0
+    assert df.loc[pd.Timestamp("2026-07-02"), "Close"] == 34.1
+    assert df.loc[pd.Timestamp("2026-07-02"), "Volume"] == 234567
 
 
 @pytest.mark.unit

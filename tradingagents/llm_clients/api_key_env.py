@@ -33,6 +33,7 @@ PROVIDER_API_KEY_ENV: dict[str, str | None] = {
     # kimi -> Moonshot AI; nvidia -> NVIDIA NIM.
     "mistral":    "MISTRAL_API_KEY",
     "kimi":       "MOONSHOT_API_KEY",
+    "mimo":       "MIMO_API_KEY",
     "groq":       "GROQ_API_KEY",
     "nvidia":     "NVIDIA_API_KEY",
     # Local runtimes do not authenticate.

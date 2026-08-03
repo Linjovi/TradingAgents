@@ -34,6 +34,7 @@ def test_registry_membership():
     ("glm-cn", "https://open.bigmodel.cn/api/paas/v4/", NormalizedChatOpenAI, False),
     ("minimax", "https://api.minimax.io/v1", MinimaxChatOpenAI, False),
     ("minimax-cn", "https://api.minimaxi.com/v1", MinimaxChatOpenAI, False),
+    ("mimo", "https://token-plan-cn.xiaomimimo.com/v1", NormalizedChatOpenAI, False),
     ("openrouter", "https://openrouter.ai/api/v1", NormalizedChatOpenAI, False),
     ("mistral", "https://api.mistral.ai/v1", NormalizedChatOpenAI, False),
     ("kimi", "https://api.moonshot.cn/v1", NormalizedChatOpenAI, False),
