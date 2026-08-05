@@ -12,6 +12,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from tradingagents.dataflows.symbol_utils import is_cn_a_share, normalize_symbol
 from tradingagents.dataflows.utils import safe_ticker_component
 
 
@@ -201,6 +202,13 @@ def resolve_instrument_identity(ticker: str) -> dict:
     return resolver(ticker)
 
 
+def resolve_cn_a_share_short_name(ticker: str) -> str | None:
+    """Resolve an A-share's Chinese short name lazily via Eastmoney."""
+    from tradingagents.dataflows.eastmoney_stock import get_cn_a_share_short_name
+
+    return get_cn_a_share_short_name(ticker)
+
+
 def _safe_report_component(value: str | None, *, max_len: int = 80) -> str | None:
     """Return a readable, single-directory component or None when unusable."""
     if not isinstance(value, str):
@@ -216,11 +224,18 @@ def _safe_report_component(value: str | None, *, max_len: int = 80) -> str | Non
 
 def report_directory_component(ticker: str) -> str:
     """Prefer the resolved Chinese/company name for report folders, fallback to ticker."""
-    identity = resolve_instrument_identity(ticker)
+    normalized_ticker = normalize_symbol(ticker)
+    if is_cn_a_share(normalized_ticker):
+        cn_short_name = _safe_report_component(resolve_cn_a_share_short_name(normalized_ticker))
+        if cn_short_name:
+            return cn_short_name
+        return safe_ticker_component(normalized_ticker)
+
+    identity = resolve_instrument_identity(normalized_ticker)
     company_name = _safe_report_component(identity.get("company_name"))
     if company_name:
         return company_name
-    return safe_ticker_component(ticker)
+    return safe_ticker_component(normalized_ticker)
 
 
 def write_report_tree(final_state: dict, ticker: str, save_path) -> Path:

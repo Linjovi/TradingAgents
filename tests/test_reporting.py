@@ -83,7 +83,31 @@ def test_report_directory_component_prefers_resolved_company_name():
         "tradingagents.reporting.resolve_instrument_identity",
         return_value={"company_name": "工业富联"},
     ):
-        assert report_directory_component("601138.SS") == "工业富联"
+        assert report_directory_component("AAPL") == "工业富联"
+
+
+@pytest.mark.unit
+def test_report_directory_component_avoids_english_company_name_for_a_share():
+    with patch(
+        "tradingagents.reporting.resolve_cn_a_share_short_name",
+        return_value=None,
+    ), patch(
+        "tradingagents.reporting.resolve_instrument_identity",
+        return_value={"company_name": "Shenzhen SDG Information Co., Ltd"},
+    ):
+        assert report_directory_component("000070.SZ") == "000070.SZ"
+
+
+@pytest.mark.unit
+def test_report_directory_component_prefers_cn_short_name_for_a_share():
+    with patch(
+        "tradingagents.reporting.resolve_cn_a_share_short_name",
+        return_value="华勤技术",
+    ), patch(
+        "tradingagents.reporting.resolve_instrument_identity",
+        return_value={"company_name": "Huaqin Co., Ltd"},
+    ):
+        assert report_directory_component("603296.SS") == "华勤技术"
 
 
 @pytest.mark.unit
@@ -92,4 +116,4 @@ def test_report_directory_component_sanitizes_resolved_company_name():
         "tradingagents.reporting.resolve_instrument_identity",
         return_value={"company_name": "工业/富联:AI\n服务器"},
     ):
-        assert report_directory_component("601138.SS") == "工业_富联_AI_服务器"
+        assert report_directory_component("AAPL") == "工业_富联_AI_服务器"

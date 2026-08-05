@@ -29,12 +29,15 @@ from .utils import safe_ticker_component
 logger = logging.getLogger(__name__)
 
 _API_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+_QUOTE_API_URL = "https://push2.eastmoney.com/api/qt/stock/get"
 _UA = "tradingagents/0.2 (+https://github.com/TauricResearch/TradingAgents)"
 _MX_DATA_API_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/query"
 _MXDS_MCP_URL = "https://mxapi.eastmoney.com/mxds/mcp"
 _MCP_PROTOCOL_VERSION = "2025-06-18"
 _DATE_COLUMN_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+_TEMPORARY_NAME_PREFIX_RE = re.compile(r"^(?:XD|XR|DR)(?=[\u4e00-\u9fff])")
 _EASTMONEY_KLINE_RETRIES = 3
+_EASTMONEY_NAME_RETRIES = 3
 
 
 def _secid(ticker: str) -> str:
@@ -49,6 +52,13 @@ def _secid(ticker: str) -> str:
     else:
         market = "0"
     return f"{market}.{code}"
+
+
+def _clean_cn_a_share_short_name(name: str | None) -> str | None:
+    if not isinstance(name, str):
+        return None
+    cleaned = _TEMPORARY_NAME_PREFIX_RE.sub("", name.strip())
+    return cleaned or None
 
 
 def _klines_to_dataframe(klines: list[str]) -> pd.DataFrame:
@@ -337,6 +347,13 @@ def _mxds_query(symbol: str, start_date: str, end_date: str) -> str:
     )
 
 
+def _mx_data_short_name_query(ticker: str) -> str:
+    code, _, suffix = ticker.strip().upper().partition(".")
+    exchange = {"SS": "SH", "SZ": "SZ", "BJ": "BJ"}.get(suffix, suffix)
+    display_symbol = f"{code}.{exchange}" if exchange else code
+    return f"查询A股{display_symbol}的股票中文简称，只返回股票简称"
+
+
 def _mxds_tool_arguments(tool: dict, symbol: str, start_date: str, end_date: str) -> dict:
     schema = tool.get("inputSchema") or tool.get("input_schema") or {}
     props = schema.get("properties") or {}
@@ -506,6 +523,29 @@ def _extract_mx_data_rows(result: dict) -> list[dict]:
     return rows
 
 
+def _extract_mx_data_short_name(result: dict) -> str | None:
+    data = result.get("data") or {}
+    inner_data = data.get("data") or {}
+    search_result = inner_data.get("searchDataResultDTO") or {}
+    dto_list = search_result.get("dataTableDTOList") or []
+
+    for dto in dto_list:
+        if not isinstance(dto, dict):
+            continue
+        table = dto.get("table") or {}
+        if not isinstance(table, dict):
+            continue
+        for key, values in table.items():
+            if key == "headName":
+                continue
+            if not isinstance(values, list):
+                values = [values]
+            for value in values:
+                if isinstance(value, str) and value.strip():
+                    return _clean_cn_a_share_short_name(value)
+    return None
+
+
 def _fetch_mx_data_ohlcv(
     ticker: str,
     start_date: str,
@@ -543,6 +583,47 @@ def _fetch_mx_data_ohlcv(
         raise NoMarketDataError(ticker, ticker, "MX data API returned no OHLCV rows")
     _assert_ohlcv_not_stale(df, end_date, ticker, ticker)
     return df
+
+
+def _fetch_mx_data_short_name(ticker: str, *, timeout: float = 30.0) -> str | None:
+    api_key = os.getenv("MX_APIKEY", "").strip()
+    if not api_key:
+        return None
+
+    req = Request(
+        os.getenv("MX_DATA_API_URL", _MX_DATA_API_URL),
+        data=json.dumps({"toolQuery": _mx_data_short_name_query(ticker)}).encode("utf-8"),
+        headers={
+            "User-Agent": _UA,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "apikey": api_key,
+        },
+        method="POST",
+    )
+    max_attempts = _EASTMONEY_NAME_RETRIES + 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except (HTTPError, OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+            logger.debug(
+                "MX data name lookup failed for %s (attempt %s/%s): %s",
+                ticker,
+                attempt,
+                max_attempts,
+                exc,
+            )
+            continue
+
+        status = result.get("status") if isinstance(result, dict) else None
+        if status != 0:
+            logger.debug("MX data name lookup returned status %s for %s", status, ticker)
+            return None
+        name = _extract_mx_data_short_name(result)
+        if name:
+            return name
+    return None
 
 
 def _fetch_eastmoney_klines(
@@ -621,6 +702,38 @@ def _fetch_eastmoney_klines(
         )
 
     raise NoMarketDataError(ticker, ticker, f"Eastmoney returned no rows between {start_date} and {end_date}")
+
+
+def get_cn_a_share_short_name(ticker: str, *, timeout: float = 8.0) -> str | None:
+    """Return the Eastmoney Chinese short name for an A-share ticker."""
+    if not is_cn_a_share(ticker):
+        return None
+
+    mx_name = _clean_cn_a_share_short_name(_fetch_mx_data_short_name(ticker))
+    if mx_name:
+        return mx_name
+
+    params = {
+        "secid": _secid(ticker),
+        "fields": "f58",
+    }
+    req = Request(
+        f"{_QUOTE_API_URL}?{urlencode(params)}",
+        headers={
+            "User-Agent": _UA,
+            "Referer": "https://quote.eastmoney.com/",
+            "Accept": "application/json, text/plain, */*",
+        },
+    )
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except (HTTPError, OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+        logger.debug("Eastmoney name lookup failed for %s: %s", ticker, exc)
+        return None
+
+    name = ((payload.get("data") or {}).get("f58") if isinstance(payload, dict) else None)
+    return _clean_cn_a_share_short_name(name)
 
 
 def _fetch_preferred_eastmoney_ohlcv(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:

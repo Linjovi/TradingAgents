@@ -72,6 +72,93 @@ def test_eastmoney_klines_raises_after_three_retries():
 
 
 @pytest.mark.unit
+def test_get_cn_a_share_short_name_reads_eastmoney_f58():
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    response = mock.MagicMock()
+    response.__enter__.return_value.read.return_value = json.dumps(
+        {"data": {"f58": "华勤技术"}}
+    ).encode("utf-8")
+
+    with mock.patch.object(em, "urlopen", return_value=response):
+        assert em.get_cn_a_share_short_name("603296.SS") == "华勤技术"
+
+
+@pytest.mark.unit
+def test_get_cn_a_share_short_name_removes_temporary_exchange_prefix(monkeypatch):
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    response = mock.MagicMock()
+    response.__enter__.return_value.read.return_value = json.dumps(
+        {"data": {"f58": "XD工业富联"}}
+    ).encode("utf-8")
+
+    monkeypatch.delenv("MX_APIKEY", raising=False)
+    with mock.patch.object(em, "urlopen", return_value=response):
+        assert em.get_cn_a_share_short_name("601138.SS") == "工业富联"
+
+
+@pytest.mark.unit
+def test_get_cn_a_share_short_name_prefers_mx_data_when_configured(monkeypatch):
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    payload = {
+        "status": 0,
+        "data": {
+            "data": {
+                "searchDataResultDTO": {
+                    "dataTableDTOList": [
+                        {
+                            "table": {
+                                "ZQMC_f58_0": ["卧龙电驱"],
+                                "headName": ["2026-08-03 20:20"],
+                            },
+                        }
+                    ],
+                },
+            },
+        },
+    }
+    response = mock.MagicMock()
+    response.__enter__.return_value.read.return_value = json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setenv("MX_APIKEY", "test-key")
+    with mock.patch.object(em, "urlopen", return_value=response) as urlopen:
+        assert em.get_cn_a_share_short_name("600580.SS") == "卧龙电驱"
+
+    request = urlopen.call_args.args[0]
+    assert request.full_url == em._MX_DATA_API_URL
+
+
+@pytest.mark.unit
+def test_get_cn_a_share_short_name_retries_transient_mx_disconnect(monkeypatch):
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    payload = {
+        "status": 0,
+        "data": {
+            "data": {
+                "searchDataResultDTO": {
+                    "dataTableDTOList": [{"table": {"ZQMC_f58_0": ["特发信息"]}}],
+                },
+            },
+        },
+    }
+    response = mock.MagicMock()
+    response.__enter__.return_value.read.return_value = json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setenv("MX_APIKEY", "test-key")
+    with mock.patch.object(
+        em,
+        "urlopen",
+        side_effect=[http.client.RemoteDisconnected("closed"), response],
+    ) as urlopen:
+        assert em.get_cn_a_share_short_name("000070.SZ") == "特发信息"
+
+    assert urlopen.call_count == 2
+
+
+@pytest.mark.unit
 def test_yfinance_stock_data_routes_a_share_to_eastmoney():
     import tradingagents.dataflows.y_finance as yfin
 
