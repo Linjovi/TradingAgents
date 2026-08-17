@@ -7,8 +7,9 @@ import yfinance as yf
 from dateutil.relativedelta import relativedelta
 
 from .config import get_config
+from .eastmoney_news import get_news_eastmoney
 from .stockstats_utils import yf_retry
-from .symbol_utils import normalize_symbol
+from .symbol_utils import is_cn_a_share, normalize_symbol
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -100,6 +101,11 @@ def get_news_yfinance(
     Returns:
         Formatted string containing news articles
     """
+    # A-shares: Yahoo news is sparse/rate-limited; Eastmoney covers CN tickers.
+    # Same pattern as OHLCV in y_finance.get_YFin_data_online.
+    if is_cn_a_share(ticker):
+        return get_news_eastmoney(ticker, start_date, end_date)
+
     article_limit = get_config()["news_article_limit"]
     # Query Yahoo with the canonical symbol, like every other yfinance path —
     # a raw broker/forex/crypto alias (XAUUSD, BTCUSD) otherwise silently
