@@ -1,9 +1,4 @@
-"""Eastmoney OHLCV fetcher for Chinese A-shares.
-
-Yahoo Finance often rate-limits A-share historical price calls. Eastmoney's
-public K-line endpoint is a better default for SSE/SZSE/BSE equities while
-leaving other markets on the existing Yahoo path.
-"""
+"""A-share OHLCV fetchers: Eastmoney public klines, MX skill API, and Tencent Finance."""
 
 from __future__ import annotations
 
@@ -18,7 +13,6 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import pandas as pd
-from dateutil.relativedelta import relativedelta
 
 from .config import get_config
 from .errors import NoMarketDataError
@@ -30,14 +24,15 @@ logger = logging.getLogger(__name__)
 
 _API_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 _QUOTE_API_URL = "https://push2.eastmoney.com/api/qt/stock/get"
+_TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 _UA = "tradingagents/0.2 (+https://github.com/TauricResearch/TradingAgents)"
 _MX_DATA_API_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/query"
 _MXDS_MCP_URL = "https://mxapi.eastmoney.com/mxds/mcp"
 _MCP_PROTOCOL_VERSION = "2025-06-18"
 _DATE_COLUMN_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 _TEMPORARY_NAME_PREFIX_RE = re.compile(r"^(?:XD|XR|DR)(?=[\u4e00-\u9fff])")
-_EASTMONEY_KLINE_RETRIES = 3
 _EASTMONEY_NAME_RETRIES = 3
+_TENCENT_KLINE_MAX_COUNT = 2000
 
 
 def _secid(ticker: str) -> str:
@@ -52,6 +47,20 @@ def _secid(ticker: str) -> str:
     else:
         market = "0"
     return f"{market}.{code}"
+
+
+def _tencent_symbol(ticker: str) -> str:
+    """Return Tencent quote symbol, e.g. 603881.SS -> sh603881."""
+    code, _, suffix = ticker.strip().upper().partition(".")
+    prefix = {"SS": "sh", "SZ": "sz", "BJ": "bj"}.get(suffix)
+    if prefix is None:
+        if code.startswith(("6", "9")):
+            prefix = "sh"
+        elif code.startswith(("4", "8")):
+            prefix = "bj"
+        else:
+            prefix = "sz"
+    return f"{prefix}{code}"
 
 
 def _clean_cn_a_share_short_name(name: str | None) -> str | None:
@@ -90,6 +99,42 @@ def _klines_to_dataframe(klines: list[str]) -> pd.DataFrame:
         )
 
     df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
+    df = df.set_index("Date")
+    df.index.name = "Date"
+    return df[["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
+
+
+def _tencent_rows_to_dataframe(rows: list) -> pd.DataFrame:
+    """Convert Tencent qfqday rows ``[date, open, close, high, low, volume]``."""
+    parsed = []
+    for item in rows:
+        if not isinstance(item, (list, tuple)) or len(item) < 6:
+            continue
+        try:
+            date = pd.to_datetime(item[0], errors="raise")
+            open_ = float(item[1])
+            close = float(item[2])
+            high = float(item[3])
+            low = float(item[4])
+            volume = int(float(item[5]))
+        except (TypeError, ValueError):
+            continue
+        parsed.append(
+            {
+                "Date": date,
+                "Open": open_,
+                "High": high,
+                "Low": low,
+                "Close": close,
+                "Adj Close": close,
+                "Volume": volume,
+            }
+        )
+
+    df = pd.DataFrame(parsed)
     if df.empty:
         return df
     df = df.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
@@ -658,50 +703,98 @@ def _fetch_eastmoney_klines(
             "Accept": "application/json, text/plain, */*",
         },
     )
-    max_attempts = _EASTMONEY_KLINE_RETRIES + 1
-    for attempt in range(1, max_attempts + 1):
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except HTTPError as exc:
+        logger.warning("Eastmoney OHLCV HTTP error %s for %s", exc.code, ticker)
+        raise NoMarketDataError(ticker, ticker, f"Eastmoney HTTP {exc.code}") from exc
+    except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+        logger.warning("Eastmoney OHLCV fetch failed for %s: %s", ticker, exc)
+        raise NoMarketDataError(ticker, ticker, f"Eastmoney error: {exc}") from exc
+
+    klines = ((payload.get("data") or {}).get("klines") or []) if isinstance(payload, dict) else []
+    df = _klines_to_dataframe(klines)
+    if df.empty:
+        raise NoMarketDataError(ticker, ticker, f"Eastmoney returned no rows between {start_date} and {end_date}")
+    _assert_ohlcv_not_stale(df, end_date, ticker, ticker)
+    return df
+
+
+def _extract_tencent_rows(payload: dict, symbol: str) -> list:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return []
+    block = data.get(symbol) or {}
+    if not isinstance(block, dict):
+        return []
+    rows = block.get("qfqday") or block.get("day") or []
+    return rows if isinstance(rows, list) else []
+
+
+def _tencent_year_windows(start_date: str, end_date: str) -> list[tuple[str, str]]:
+    start = datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.strptime(end_date, "%Y-%m-%d")
+    windows = []
+    for year in range(start.year, end.year + 1):
+        window_start = start if year == start.year else datetime(year, 1, 1)
+        window_end = end if year == end.year else datetime(year, 12, 31)
+        windows.append((window_start.strftime("%Y-%m-%d"), window_end.strftime("%Y-%m-%d")))
+    return windows
+
+
+def _fetch_tencent_klines(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    *,
+    timeout: float = 12.0,
+) -> pd.DataFrame:
+    """Fetch daily forward-adjusted A-share klines from Tencent Finance."""
+    if not is_cn_a_share(ticker):
+        raise NoMarketDataError(ticker, ticker, "Tencent OHLCV only supports A-share tickers")
+
+    symbol = _tencent_symbol(ticker)
+    frames: list[pd.DataFrame] = []
+    for window_start, window_end in _tencent_year_windows(start_date, end_date):
+        start_dt = datetime.strptime(window_start, "%Y-%m-%d")
+        end_dt = datetime.strptime(window_end, "%Y-%m-%d")
+        count = min(max((end_dt - start_dt).days + 10, 20), _TENCENT_KLINE_MAX_COUNT)
+        param = f"{symbol},day,{window_start},{window_end},{count},qfq"
+        req = Request(
+            f"{_TENCENT_KLINE_URL}?{urlencode({'param': param})}",
+            headers={
+                "User-Agent": _UA,
+                "Referer": "https://finance.qq.com/",
+                "Accept": "application/json, text/plain, */*",
+            },
+        )
         try:
             with urlopen(req, timeout=timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8", errors="replace"))
         except HTTPError as exc:
-            logger.warning(
-                "Eastmoney OHLCV HTTP error %s for %s (attempt %s/%s)",
-                exc.code,
-                ticker,
-                attempt,
-                max_attempts,
-            )
-            if attempt == max_attempts:
-                raise NoMarketDataError(ticker, ticker, f"Eastmoney HTTP {exc.code}") from exc
-            continue
+            logger.warning("Tencent OHLCV HTTP error %s for %s", exc.code, ticker)
+            raise NoMarketDataError(ticker, ticker, f"Tencent HTTP {exc.code}") from exc
         except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
-            logger.warning(
-                "Eastmoney OHLCV fetch failed for %s (attempt %s/%s): %s",
-                ticker,
-                attempt,
-                max_attempts,
-                exc,
-            )
-            if attempt == max_attempts:
-                raise NoMarketDataError(ticker, ticker, f"Eastmoney error: {exc}") from exc
-            continue
+            logger.warning("Tencent OHLCV fetch failed for %s: %s", ticker, exc)
+            raise NoMarketDataError(ticker, ticker, f"Tencent error: {exc}") from exc
 
-        klines = ((payload.get("data") or {}).get("klines") or []) if isinstance(payload, dict) else []
-        df = _klines_to_dataframe(klines)
+        df = _tencent_rows_to_dataframe(_extract_tencent_rows(payload, symbol))
         if not df.empty:
-            _assert_ohlcv_not_stale(df, end_date, ticker, ticker)
-            return df
+            frames.append(df)
 
-        logger.warning(
-            "Eastmoney returned no OHLCV rows for %s between %s and %s (attempt %s/%s)",
-            ticker,
-            start_date,
-            end_date,
-            attempt,
-            max_attempts,
-        )
+    if not frames:
+        raise NoMarketDataError(ticker, ticker, f"Tencent returned no rows between {start_date} and {end_date}")
 
-    raise NoMarketDataError(ticker, ticker, f"Eastmoney returned no rows between {start_date} and {end_date}")
+    data = pd.concat(frames).sort_index()
+    data = data[~data.index.duplicated(keep="last")]
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
+    data = data[(data.index >= start_ts) & (data.index <= end_ts)]
+    if data.empty:
+        raise NoMarketDataError(ticker, ticker, f"Tencent returned no rows between {start_date} and {end_date}")
+    _assert_ohlcv_not_stale(data, end_date, ticker, ticker)
+    return data
 
 
 def get_cn_a_share_short_name(ticker: str, *, timeout: float = 8.0) -> str | None:
@@ -737,24 +830,25 @@ def get_cn_a_share_short_name(ticker: str, *, timeout: float = 8.0) -> str | Non
 
 
 def _fetch_preferred_eastmoney_ohlcv(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """Fetch A-share OHLCV from the preferred Eastmoney-backed source."""
-    mx_error: NoMarketDataError | None = None
+    """Fetch A-share OHLCV from MX, then Eastmoney, then Tencent."""
     if os.getenv("MX_APIKEY", "").strip():
         try:
             return _fetch_mx_data_ohlcv(symbol, start_date, end_date)
         except NoMarketDataError as exc:
-            mx_error = exc
             logger.warning("MX data OHLCV fetch failed for %s: %s", symbol, exc)
         except (HTTPError, OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
-            mx_error = NoMarketDataError(symbol, symbol, f"MX data API error: {exc}")
             logger.warning("MX data OHLCV fetch failed for %s: %s", symbol, exc)
 
     try:
         return _fetch_eastmoney_klines(symbol, start_date, end_date)
     except NoMarketDataError as exc:
-        if mx_error is not None:
-            raise mx_error from exc
-        raise
+        logger.warning(
+            "Eastmoney OHLCV fetch failed for %s: %s; falling back to Tencent",
+            symbol,
+            exc,
+        )
+
+    return _fetch_tencent_klines(symbol, start_date, end_date)
 
 
 def get_stock_data_eastmoney(symbol: str, start_date: str, end_date: str) -> str:
