@@ -129,6 +129,47 @@ def _escape_cell(value: str | None) -> str:
     return " ".join(value.split()).replace("|", r"\|")
 
 
+def _latest_run(runs: list[dict]) -> dict:
+    return max(runs, key=lambda item: item["sort_key"])
+
+
+def _instrument_label(instrument: str, run: dict) -> str:
+    ticker = run.get("ticker")
+    name = f"{instrument}（{ticker}）" if ticker else instrument
+    report_date = (run.get("time") or "").split(" ", 1)[0]
+    return f"{name}，{report_date}" if report_date else name
+
+
+def _rating_sort_key(rating: str | None) -> tuple[int, str]:
+    if not rating:
+        return (len(_RATINGS), "")
+    for index, (english, chinese) in enumerate(_RATINGS.values()):
+        if rating == f"{english}（{chinese}）":
+            return (index, rating)
+    return (len(_RATINGS), rating)
+
+
+def _render_rating_rollup(instruments: dict[str, list[dict]]) -> list[str]:
+    """Group each instrument by the rating of its newest saved report."""
+    buckets: dict[str, list[str]] = {}
+    for instrument in sorted(instruments):
+        latest = _latest_run(instruments[instrument])
+        rating = latest.get("rating") or "未解析"
+        buckets.setdefault(rating, []).append(_instrument_label(instrument, latest))
+
+    lines = [
+        "",
+        "## 按最终评级归总",
+        "",
+        "各标的取最新一份报告的评级。",
+    ]
+    for rating in sorted(buckets, key=_rating_sort_key):
+        names = buckets[rating]
+        lines.extend(["", f"### {rating}（{len(names)}）", ""])
+        lines.extend(f"- {name}" for name in names)
+    return lines
+
+
 def render_summary_markdown(entries: list[dict], *, generated_at=None) -> str:
     """Render the per-instrument summary document."""
     generated_at = generated_at or datetime.now()
@@ -143,6 +184,8 @@ def render_summary_markdown(entries: list[dict], *, generated_at=None) -> str:
         "",
         f"标的数: {len(instruments)} ｜ 报告数: {len(entries)}",
     ]
+    if instruments:
+        lines.extend(_render_rating_rollup(instruments))
 
     for instrument in sorted(instruments):
         runs = sorted(instruments[instrument], key=lambda item: item["sort_key"])

@@ -67,8 +67,8 @@ def test_save_reports_defaults_under_results_dir(tmp_path):
 
     mock_self = SimpleNamespace(config={"results_dir": str(tmp_path)})
     with patch(
-        "tradingagents.reporting.resolve_instrument_identity",
-        return_value={"company_name": "工业富联"},
+        "tradingagents.reporting.lookup_local_ticker_name",
+        return_value="工业富联",
     ):
         out = TradingAgentsGraph.save_reports(mock_self, _state(), "601138.SS")
     assert out.exists()
@@ -80,6 +80,9 @@ def test_save_reports_defaults_under_results_dir(tmp_path):
 @pytest.mark.unit
 def test_report_directory_component_prefers_resolved_company_name():
     with patch(
+        "tradingagents.reporting.lookup_local_ticker_name",
+        return_value=None,
+    ), patch(
         "tradingagents.reporting.resolve_instrument_identity",
         return_value={"company_name": "工业富联"},
     ):
@@ -89,6 +92,9 @@ def test_report_directory_component_prefers_resolved_company_name():
 @pytest.mark.unit
 def test_report_directory_component_avoids_english_company_name_for_a_share():
     with patch(
+        "tradingagents.reporting.lookup_local_ticker_name",
+        return_value=None,
+    ), patch(
         "tradingagents.reporting.resolve_cn_a_share_short_name",
         return_value=None,
     ), patch(
@@ -101,6 +107,9 @@ def test_report_directory_component_avoids_english_company_name_for_a_share():
 @pytest.mark.unit
 def test_report_directory_component_prefers_cn_short_name_for_a_share():
     with patch(
+        "tradingagents.reporting.lookup_local_ticker_name",
+        return_value=None,
+    ), patch(
         "tradingagents.reporting.resolve_cn_a_share_short_name",
         return_value="华勤技术",
     ), patch(
@@ -111,8 +120,39 @@ def test_report_directory_component_prefers_cn_short_name_for_a_share():
 
 
 @pytest.mark.unit
+def test_report_directory_component_prefers_local_map_over_api():
+    with patch(
+        "tradingagents.reporting.lookup_local_ticker_name",
+        return_value="今世缘",
+    ), patch(
+        "tradingagents.reporting.resolve_cn_a_share_short_name",
+        return_value="接口返回的名字",
+    ) as api_lookup:
+        assert report_directory_component("603369.SS") == "今世缘"
+        api_lookup.assert_not_called()
+
+
+@pytest.mark.unit
+def test_lookup_local_ticker_name_reads_map_file(tmp_path):
+    from tradingagents.reporting import load_ticker_name_map, lookup_local_ticker_name
+
+    map_path = tmp_path / "ticker_names.json"
+    map_path.write_text('{"601138.SS": "工业富联"}', encoding="utf-8")
+    indexed = load_ticker_name_map(map_path)
+    assert indexed["601138"] == "工业富联"
+    with patch(
+        "tradingagents.reporting.load_ticker_name_map",
+        return_value=indexed,
+    ):
+        assert lookup_local_ticker_name("601138.SH") == "工业富联"
+
+
+@pytest.mark.unit
 def test_report_directory_component_sanitizes_resolved_company_name():
     with patch(
+        "tradingagents.reporting.lookup_local_ticker_name",
+        return_value=None,
+    ), patch(
         "tradingagents.reporting.resolve_instrument_identity",
         return_value={"company_name": "工业/富联:AI\n服务器"},
     ):

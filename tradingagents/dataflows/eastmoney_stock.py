@@ -7,6 +7,9 @@ import json
 import logging
 import os
 import re
+import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -31,8 +34,13 @@ _MXDS_MCP_URL = "https://mxapi.eastmoney.com/mxds/mcp"
 _MCP_PROTOCOL_VERSION = "2025-06-18"
 _DATE_COLUMN_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 _TEMPORARY_NAME_PREFIX_RE = re.compile(r"^(?:XD|XR|DR)(?=[\u4e00-\u9fff])")
-_EASTMONEY_NAME_RETRIES = 3
 _TENCENT_KLINE_MAX_COUNT = 2000
+_MX_REQUEST_RETRIES = 3
+_MX_MIN_INTERVAL_SECONDS = 3.0
+_MX_RETRY_BASE_DELAY_SECONDS = 2.0
+# The MX gateway answers HTTP 200 with a nested business status; these mark throttling.
+_MX_THROTTLE_CODES = {429, 503}
+_MX_THROTTLE_HINTS = ("过于频繁", "频繁", "限流", "rate limit", "too many requests")
 
 
 def _secid(ticker: str) -> str:
@@ -591,6 +599,120 @@ def _extract_mx_data_short_name(result: dict) -> str | None:
     return None
 
 
+class MxDataError(RuntimeError):
+    """The MX skill API answered with a business-level error instead of data."""
+
+    def __init__(self, message: str, *, throttled: bool = False) -> None:
+        super().__init__(message)
+        self.throttled = throttled
+
+
+def _mx_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _mx_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+_mx_request_lock = threading.Lock()
+_mx_last_request_at = 0.0
+
+
+@contextmanager
+def _mx_request_slot():
+    """Serialize MX calls process-wide and space them out; the gateway throttles bursts."""
+    global _mx_last_request_at
+
+    with _mx_request_lock:
+        idle = time.monotonic() - _mx_last_request_at
+        pause = _mx_float_env("MX_MIN_INTERVAL_SECONDS", _MX_MIN_INTERVAL_SECONDS) - idle
+        if pause > 0:
+            time.sleep(pause)
+        try:
+            yield
+        finally:
+            _mx_last_request_at = time.monotonic()
+
+
+def _mx_data_business_error(result) -> MxDataError | None:
+    """Return the nested MX error, if any. Success is status 0 at both envelope levels."""
+    if not isinstance(result, dict):
+        return MxDataError("invalid response")
+
+    outer_status = result.get("status")
+    if outer_status != 0:
+        return MxDataError(f"{outer_status}: {result.get('message', 'unknown')}")
+
+    inner = result.get("data")
+    if not isinstance(inner, dict):
+        return None
+
+    status = inner.get("status")
+    code = inner.get("code")
+    if status in (None, 0) and code in (None, 0, 200):
+        return None
+
+    message = str(inner.get("message") or "unknown")
+    throttled = code in _MX_THROTTLE_CODES or any(hint in message.lower() for hint in _MX_THROTTLE_HINTS)
+    return MxDataError(f"{code if code is not None else status}: {message}", throttled=throttled)
+
+
+def _post_mx_data(query: str, api_key: str, *, timeout: float, context: str) -> dict:
+    """POST a query to the MX skill API, retrying throttled and transient failures."""
+    req = Request(
+        os.getenv("MX_DATA_API_URL", _MX_DATA_API_URL),
+        data=json.dumps({"toolQuery": query}).encode("utf-8"),
+        headers={
+            "User-Agent": _UA,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "apikey": api_key,
+        },
+        method="POST",
+    )
+
+    attempts = max(_mx_int_env("MX_REQUEST_RETRIES", _MX_REQUEST_RETRIES), 0) + 1
+    delay = _mx_float_env("MX_RETRY_BASE_DELAY_SECONDS", _MX_RETRY_BASE_DELAY_SECONDS)
+    last_error = "unknown"
+
+    for attempt in range(1, attempts + 1):
+        try:
+            with _mx_request_slot():
+                with urlopen(req, timeout=timeout) as resp:
+                    result = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except (HTTPError, OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            retryable = True
+        else:
+            error = _mx_data_business_error(result)
+            if error is None:
+                return result
+            last_error = str(error)
+            retryable = error.throttled
+
+        if not retryable or attempt == attempts:
+            break
+
+        logger.debug(
+            "MX data request retrying for %s (attempt %s/%s): %s",
+            context,
+            attempt,
+            attempts,
+            last_error,
+        )
+        time.sleep(delay)
+        delay *= 2
+
+    raise MxDataError(last_error)
+
+
 def _fetch_mx_data_ohlcv(
     ticker: str,
     start_date: str,
@@ -603,24 +725,15 @@ def _fetch_mx_data_ohlcv(
     if not api_key:
         raise NoMarketDataError(ticker, ticker, "MX data API is not configured; set MX_APIKEY")
 
-    req = Request(
-        os.getenv("MX_DATA_API_URL", _MX_DATA_API_URL),
-        data=json.dumps({"toolQuery": _mxds_query(ticker, start_date, end_date)}).encode("utf-8"),
-        headers={
-            "User-Agent": _UA,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "apikey": api_key,
-        },
-        method="POST",
-    )
-    with urlopen(req, timeout=timeout) as resp:
-        result = json.loads(resp.read().decode("utf-8", errors="replace"))
-
-    status = result.get("status") if isinstance(result, dict) else None
-    if status != 0:
-        message = result.get("message", "unknown") if isinstance(result, dict) else "invalid response"
-        raise NoMarketDataError(ticker, ticker, f"MX data API error {status}: {message}")
+    try:
+        result = _post_mx_data(
+            _mxds_query(ticker, start_date, end_date),
+            api_key,
+            timeout=timeout,
+            context=ticker,
+        )
+    except MxDataError as exc:
+        raise NoMarketDataError(ticker, ticker, f"MX data API error {exc}") from exc
 
     rows = _extract_mx_data_rows(result)
     df = _mxds_rows_to_dataframe(rows)
@@ -635,40 +748,18 @@ def _fetch_mx_data_short_name(ticker: str, *, timeout: float = 30.0) -> str | No
     if not api_key:
         return None
 
-    req = Request(
-        os.getenv("MX_DATA_API_URL", _MX_DATA_API_URL),
-        data=json.dumps({"toolQuery": _mx_data_short_name_query(ticker)}).encode("utf-8"),
-        headers={
-            "User-Agent": _UA,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "apikey": api_key,
-        },
-        method="POST",
-    )
-    max_attempts = _EASTMONEY_NAME_RETRIES + 1
-    for attempt in range(1, max_attempts + 1):
-        try:
-            with urlopen(req, timeout=timeout) as resp:
-                result = json.loads(resp.read().decode("utf-8", errors="replace"))
-        except (HTTPError, OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
-            logger.debug(
-                "MX data name lookup failed for %s (attempt %s/%s): %s",
-                ticker,
-                attempt,
-                max_attempts,
-                exc,
-            )
-            continue
+    try:
+        result = _post_mx_data(
+            _mx_data_short_name_query(ticker),
+            api_key,
+            timeout=timeout,
+            context=ticker,
+        )
+    except MxDataError as exc:
+        logger.debug("MX data name lookup failed for %s: %s", ticker, exc)
+        return None
 
-        status = result.get("status") if isinstance(result, dict) else None
-        if status != 0:
-            logger.debug("MX data name lookup returned status %s for %s", status, ticker)
-            return None
-        name = _extract_mx_data_short_name(result)
-        if name:
-            return name
-    return None
+    return _extract_mx_data_short_name(result)
 
 
 def _fetch_eastmoney_klines(

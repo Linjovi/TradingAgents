@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import time
 from unittest import mock
 
 import pandas as pd
@@ -262,6 +263,8 @@ def test_get_cn_a_share_short_name_prefers_mx_data_when_configured(monkeypatch):
 def test_get_cn_a_share_short_name_retries_transient_mx_disconnect(monkeypatch):
     from tradingagents.dataflows import eastmoney_stock as em
 
+    monkeypatch.setenv("MX_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("MX_RETRY_BASE_DELAY_SECONDS", "0")
     payload = {
         "status": 0,
         "data": {
@@ -462,6 +465,136 @@ def test_mxds_tool_selection_prefers_a_share_finance_tool():
     ]
 
     assert _choose_mxds_kline_tool(tools)["name"] == "mx_ashare_finance_data"
+
+
+def _mx_throttled_response():
+    payload = {
+        "success": True,
+        "status": 0,
+        "code": 0,
+        "message": "ok",
+        "data": {"message": "操作过于频繁", "status": -1, "code": 503, "data": None},
+    }
+    response = mock.MagicMock()
+    response.__enter__.return_value.read.return_value = json.dumps(payload).encode("utf-8")
+    return response
+
+
+def _mx_ohlcv_response():
+    payload = {
+        "status": 0,
+        "data": {
+            "status": 0,
+            "code": 0,
+            "message": "OK",
+            "data": {
+                "searchDataResultDTO": {
+                    "dataTableDTOList": [
+                        {
+                            "table": {
+                                "headName": ["2026-07-01"],
+                                "1": [33.0],
+                                "2": [33.8],
+                                "3": [32.9],
+                                "4": [33.25],
+                                "5": [123456],
+                            },
+                            "nameMap": {
+                                "1": "开盘价",
+                                "2": "最高价",
+                                "3": "最低价",
+                                "4": "收盘价",
+                                "5": "成交量",
+                            },
+                        }
+                    ]
+                }
+            },
+        },
+    }
+    response = mock.MagicMock()
+    response.__enter__.return_value.read.return_value = json.dumps(payload).encode("utf-8")
+    return response
+
+
+@pytest.mark.unit
+def test_mx_data_throttle_error_is_reported_verbatim(monkeypatch):
+    from tradingagents.dataflows import eastmoney_stock as em
+    from tradingagents.dataflows.errors import NoMarketDataError
+
+    monkeypatch.setenv("MX_APIKEY", "test-key")
+    monkeypatch.setenv("MX_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("MX_RETRY_BASE_DELAY_SECONDS", "0")
+    monkeypatch.setenv("MX_REQUEST_RETRIES", "2")
+
+    with mock.patch.object(
+        em,
+        "urlopen",
+        side_effect=[_mx_throttled_response() for _ in range(3)],
+    ) as urlopen:
+        with pytest.raises(NoMarketDataError, match="操作过于频繁"):
+            em._fetch_mx_data_ohlcv("600276.SS", "2026-07-01", "2026-07-02")
+
+    assert urlopen.call_count == 3
+
+
+@pytest.mark.unit
+def test_mx_data_retries_throttle_then_returns_rows(monkeypatch):
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    monkeypatch.setenv("MX_APIKEY", "test-key")
+    monkeypatch.setenv("MX_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("MX_RETRY_BASE_DELAY_SECONDS", "0")
+
+    with mock.patch.object(
+        em,
+        "urlopen",
+        side_effect=[_mx_throttled_response(), _mx_ohlcv_response()],
+    ) as urlopen, mock.patch.object(em, "_assert_ohlcv_not_stale"):
+        df = em._fetch_mx_data_ohlcv("600276.SS", "2026-07-01", "2026-07-01")
+
+    assert urlopen.call_count == 2
+    assert df.loc[pd.Timestamp("2026-07-01"), "Close"] == 33.25
+
+
+@pytest.mark.unit
+def test_mx_data_requests_never_overlap_across_threads(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    monkeypatch.setenv("MX_APIKEY", "test-key")
+    monkeypatch.setenv("MX_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("MX_RETRY_BASE_DELAY_SECONDS", "0")
+
+    state = threading.Lock()
+    in_flight = 0
+    peak = 0
+
+    def fake_urlopen(*_args, **_kwargs):
+        nonlocal in_flight, peak
+        with state:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        time.sleep(0.05)
+        with state:
+            in_flight -= 1
+        return _mx_ohlcv_response()
+
+    with mock.patch.object(em, "urlopen", side_effect=fake_urlopen), mock.patch.object(
+        em, "_assert_ohlcv_not_stale"
+    ):
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            frames = list(
+                pool.map(
+                    lambda ticker: em._fetch_mx_data_ohlcv(ticker, "2026-07-01", "2026-07-01"),
+                    ["002555.SZ", "600276.SS", "600498.SS"],
+                )
+            )
+
+    assert peak == 1
+    assert all(len(frame) == 1 for frame in frames)
 
 
 @pytest.mark.unit

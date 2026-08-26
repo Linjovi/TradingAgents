@@ -3,6 +3,7 @@ import os
 import sys
 import time
 from collections import deque
+from contextlib import nullcontext
 from functools import wraps
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from cli.utils import (
     detect_asset_type,
     ensure_api_key,
     get_ticker,
+    normalize_ticker_symbol,
     prompt_openai_compatible_url,
     resolve_backend_url,
     select_analysts,
@@ -49,7 +51,7 @@ from tradingagents.graph.analyst_execution import (
     sync_analyst_tracker_from_chunk,
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
-from tradingagents.reporting import report_directory_component, write_report_tree
+from tradingagents.reporting import write_report_tree
 from tradingagents.dataflows.errors import VendorError
 
 console = Console()
@@ -508,8 +510,12 @@ def update_display(layout, spinner_text=None, stats_handler=None, start_time=Non
     layout["footer"].update(Panel(stats_table, border_style="grey50"))
 
 
-def get_user_selections():
-    """Get all user selections before starting the analysis display."""
+def get_user_selections(ticker: str | None = None):
+    """Get all user selections before starting the analysis display.
+
+    When ``ticker`` is provided (batch mode), skip the ticker prompt and continue
+    from analysis date onward with the same remaining questions.
+    """
     # Display ASCII art welcome message
     with open(Path(__file__).parent / "static" / "welcome.txt", encoding="utf-8") as f:
         welcome_ascii = f.read()
@@ -562,14 +568,21 @@ def get_user_selections():
         return prompt_fn()
 
     # Step 1: Ticker symbol
-    console.print(
-        create_question_box(
-            "Step 1: Ticker Symbol",
-            "Enter the ticker, with exchange suffix when needed (e.g. SPY, 0700.HK, BTC-USD)",
-            "SPY",
+    if ticker:
+        selected_ticker = normalize_ticker_symbol(ticker)
+        console.print(
+            f"[green]✓ Ticker:[/green] {selected_ticker} "
+            "(remaining settings apply to every selected ticker)"
         )
-    )
-    selected_ticker = get_ticker()
+    else:
+        console.print(
+            create_question_box(
+                "Step 1: Ticker Symbol",
+                "Enter the ticker, with exchange suffix when needed (e.g. SPY, 0700.HK, BTC-USD)",
+                "SPY",
+            )
+        )
+        selected_ticker = get_ticker()
     asset_type = detect_asset_type(selected_ticker)
     # Only announce when it's not the default stock path, to avoid printing
     # "stock" on every run.
@@ -1017,9 +1030,17 @@ def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
     return config
 
 
-def run_analysis(checkpoint: bool | None = None):
-    # First get all user selections
-    selections = get_user_selections()
+def run_analysis(
+    checkpoint: bool | None = None,
+    selections: dict | None = None,
+    *,
+    live: bool = True,
+    auto_save: bool = False,
+    prompt_display: bool = True,
+):
+    # First get all user selections unless a batch/worker already supplied them
+    if selections is None:
+        selections = get_user_selections()
 
     config = _build_run_config(selections, checkpoint)
 
@@ -1094,12 +1115,20 @@ def run_analysis(checkpoint: bool | None = None):
     message_buffer.add_tool_call = save_tool_call_decorator(message_buffer, "add_tool_call")
     message_buffer.update_report_section = save_report_section_decorator(message_buffer, "update_report_section")
 
-    # Now start the display layout
-    layout = create_layout()
+    # Now start the display layout (batch workers skip the Live dashboard)
+    layout = create_layout() if live else None
 
-    with Live(layout, refresh_per_second=4):
+    def refresh_display(spinner_text=None):
+        if layout is None:
+            return
+        update_display(
+            layout, spinner_text, stats_handler=stats_handler, start_time=start_time
+        )
+
+    live_cm = Live(layout, refresh_per_second=4) if live else nullcontext()
+    with live_cm:
         # Initial display
-        update_display(layout, stats_handler=stats_handler, start_time=start_time)
+        refresh_display()
 
         # Add initial messages
         message_buffer.add_message("System", f"Selected ticker: {selections['ticker']}")
@@ -1112,19 +1141,21 @@ def run_analysis(checkpoint: bool | None = None):
             "System",
             f"Selected analysts: {', '.join(analyst.value for analyst in selections['analysts'])}",
         )
-        update_display(layout, stats_handler=stats_handler, start_time=start_time)
+        refresh_display()
 
         # Update agent status to in_progress for the first analyst
         first_analyst = get_initial_analyst_node(analyst_execution_plan)
         message_buffer.update_agent_status(first_analyst, "in_progress")
         analyst_wall_time_tracker.mark_started(selected_analyst_keys[0])
-        update_display(layout, stats_handler=stats_handler, start_time=start_time)
+        refresh_display()
 
         # Create spinner text
         spinner_text = (
             f"Analyzing {selections['ticker']} on {selections['analysis_date']}..."
         )
-        update_display(layout, spinner_text, stats_handler=stats_handler, start_time=start_time)
+        refresh_display(spinner_text)
+        if not live:
+            console.print(spinner_text)
 
         # Initialize state and get graph args with callbacks.
         # Resolve the instrument identity once here so all agents anchor to
@@ -1243,7 +1274,7 @@ def run_analysis(checkpoint: bool | None = None):
                     message_buffer.update_agent_status("Portfolio Manager", "completed")
 
             # Update the display
-            update_display(layout, stats_handler=stats_handler, start_time=start_time)
+            refresh_display()
 
             trace.append(chunk)
 
@@ -1267,20 +1298,26 @@ def run_analysis(checkpoint: bool | None = None):
             if section in final_state:
                 message_buffer.update_report_section(section, final_state[section])
 
-        update_display(layout, stats_handler=stats_handler, start_time=start_time)
+        refresh_display()
 
-    # Post-analysis prompts (outside Live context for clean interaction)
+    # Post-analysis: batch mode writes the default path with no confirmation
     console.print("\n[bold cyan]Analysis Complete![/bold cyan]\n")
     console.print(f"[dim]{analyst_wall_time_tracker.format_summary()}[/dim]")
 
-    # Prompt to save report
+    from cli.batch import default_report_save_path
+
+    if auto_save:
+        save_path = default_report_save_path(selections["ticker"])
+        report_file = save_report_to_disk(final_state, selections["ticker"], save_path)
+        console.print(f"\n[green]✓ Report saved to:[/green] {save_path.resolve()}")
+        console.print(f"  [dim]Complete report:[/dim] {report_file.name}")
+        return
+
     save_choice = typer.prompt("Save report?", default="Y").strip().upper()
     if save_choice in ("Y", "YES", ""):
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_path = Path.cwd() / "reports" / report_directory_component(selections["ticker"]) / timestamp
         save_path_str = typer.prompt(
             "Save path (press Enter for default)",
-            default=str(default_path)
+            default=str(default_report_save_path(selections["ticker"])),
         ).strip()
         save_path = Path(save_path_str)
         try:
@@ -1290,7 +1327,8 @@ def run_analysis(checkpoint: bool | None = None):
         except Exception as e:
             console.print(f"[red]Error saving report: {e}[/red]")
 
-    # Prompt to display full report
+    if not prompt_display:
+        return
     display_choice = typer.prompt("\nDisplay full report on screen?", default="Y").strip().upper()
     if display_choice in ("Y", "YES", ""):
         display_complete_report(final_state)

@@ -8,12 +8,15 @@ run does.
 """
 
 import html
+import json
 import re
 from datetime import datetime
 from pathlib import Path
 
 from tradingagents.dataflows.symbol_utils import is_cn_a_share, normalize_symbol
 from tradingagents.dataflows.utils import safe_ticker_component
+
+TICKER_NAME_MAP_FILENAME = "ticker_names.json"
 
 
 _INVALID_REPORT_COMPONENT_RE = re.compile(r"[\x00-\x1f\x7f/\\:]+")
@@ -209,6 +212,89 @@ def resolve_cn_a_share_short_name(ticker: str) -> str | None:
     return get_cn_a_share_short_name(ticker)
 
 
+def _ticker_name_aliases(ticker: str) -> list[str]:
+    """Return lookup keys so ``601138``, ``601138.SS`` and ``601138.SH`` match."""
+    aliases: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str | None) -> None:
+        if not value or value in seen:
+            return
+        seen.add(value)
+        aliases.append(value)
+
+    raw = ticker.strip()
+    add(raw)
+    add(raw.upper())
+    normalized = normalize_symbol(raw)
+    add(normalized)
+    add(normalized.upper())
+
+    for candidate in list(aliases):
+        if "." not in candidate:
+            continue
+        code, suffix = candidate.rsplit(".", 1)
+        suffix = suffix.upper()
+        if not code.isdigit() or suffix not in {"SS", "SH", "SZ", "BJ"}:
+            continue
+        add(code)
+        if suffix in {"SS", "SH"}:
+            add(f"{code}.SS")
+            add(f"{code}.SH")
+
+    return aliases
+
+
+def _ticker_name_map_candidates() -> list[Path]:
+    """Prefer the CWD reports dir, then the repo-root ``reports/`` copy."""
+    repo_root = Path(__file__).resolve().parents[1]
+    return [
+        Path.cwd() / "reports" / TICKER_NAME_MAP_FILENAME,
+        repo_root / "reports" / TICKER_NAME_MAP_FILENAME,
+    ]
+
+
+def load_ticker_name_map(path: Path | None = None) -> dict[str, str]:
+    """Load ``code -> short name`` entries and index ticker aliases."""
+    candidates = [path] if path is not None else _ticker_name_map_candidates()
+    raw: dict = {}
+    for candidate in candidates:
+        if candidate is None or not candidate.is_file():
+            continue
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            raw = payload
+            break
+
+    indexed: dict[str, str] = {}
+    for key, name in raw.items():
+        if not isinstance(key, str) or key.startswith("_"):
+            continue
+        if not isinstance(name, str):
+            continue
+        cleaned_name = name.strip()
+        if not cleaned_name:
+            continue
+        for alias in _ticker_name_aliases(key):
+            indexed.setdefault(alias, cleaned_name)
+    return indexed
+
+
+def lookup_local_ticker_name(ticker: str) -> str | None:
+    """Return the configured short name for ``ticker``, if present."""
+    if not isinstance(ticker, str) or not ticker.strip():
+        return None
+    indexed = load_ticker_name_map()
+    for alias in _ticker_name_aliases(ticker):
+        name = indexed.get(alias)
+        if name:
+            return name
+    return None
+
+
 def _safe_report_component(value: str | None, *, max_len: int = 80) -> str | None:
     """Return a readable, single-directory component or None when unusable."""
     if not isinstance(value, str):
@@ -223,8 +309,12 @@ def _safe_report_component(value: str | None, *, max_len: int = 80) -> str | Non
 
 
 def report_directory_component(ticker: str) -> str:
-    """Prefer the resolved Chinese/company name for report folders, fallback to ticker."""
+    """Prefer the configured short name, then API identity, then the ticker."""
     normalized_ticker = normalize_symbol(ticker)
+    local_name = _safe_report_component(lookup_local_ticker_name(normalized_ticker))
+    if local_name:
+        return local_name
+
     if is_cn_a_share(normalized_ticker):
         cn_short_name = _safe_report_component(resolve_cn_a_share_short_name(normalized_ticker))
         if cn_short_name:
