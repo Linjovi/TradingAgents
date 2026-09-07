@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from tradingagents.reporting import TICKER_NAME_MAP_FILENAME, report_directory_c
 
 console = Console()
 _print_lock = threading.Lock()
+_DEFAULT_STAGGER_SECONDS = 30.0
 
 
 def list_ticker_entries(path: Path | None = None) -> list[tuple[str, str]]:
@@ -194,26 +196,42 @@ def _spawn_worker(
         Path(payload_path).unlink(missing_ok=True)
 
 
+def _batch_stagger_seconds() -> float:
+    raw = os.getenv("BATCH_STAGGER_SECONDS", "").strip()
+    if not raw:
+        return _DEFAULT_STAGGER_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _DEFAULT_STAGGER_SECONDS
+
+
 def run_parallel(
     tickers: list[str],
     shared: dict,
     checkpoint: bool | None = None,
+    stagger_seconds: float | None = None,
 ) -> int:
     jobs: dict[str, dict] = {}
     for ticker in tickers:
         jobs[ticker] = serialize_selections(selections_for_ticker(shared, ticker))
 
+    delay = _batch_stagger_seconds() if stagger_seconds is None else max(0.0, stagger_seconds)
+    stagger_note = ""
+    if delay > 0 and len(tickers) > 1:
+        stagger_note = f" Starting one job every {delay:g}s."
     console.print(
-        f"\n[bold]Running {len(tickers)} analyses in parallel.[/bold]"
+        f"\n[bold]Running {len(tickers)} analyses in parallel.[/bold]{stagger_note}"
         " Reports save to the default path when each job finishes.\n"
     )
 
     failures: list[str] = []
     with ThreadPoolExecutor(max_workers=len(tickers)) as pool:
-        futures = {
-            pool.submit(_spawn_worker, ticker, payload, checkpoint): ticker
-            for ticker, payload in jobs.items()
-        }
+        futures: dict = {}
+        for index, (ticker, payload) in enumerate(jobs.items()):
+            if index > 0 and delay > 0:
+                time.sleep(delay)
+            futures[pool.submit(_spawn_worker, ticker, payload, checkpoint)] = ticker
         for future in as_completed(futures):
             ticker, code = future.result()
             if code == 0:

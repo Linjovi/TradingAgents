@@ -15,6 +15,11 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no flock
+    fcntl = None
+
 import pandas as pd
 
 from .config import get_config
@@ -27,7 +32,11 @@ logger = logging.getLogger(__name__)
 
 _API_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 _QUOTE_API_URL = "https://push2.eastmoney.com/api/qt/stock/get"
-_TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+_TENCENT_KLINE_URLS = (
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get",
+    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+)
 _UA = "tradingagents/0.2 (+https://github.com/TauricResearch/TradingAgents)"
 _MX_DATA_API_URL = "https://mkapi2.dfcfs.com/finskillshub/api/claw/query"
 _MXDS_MCP_URL = "https://mxapi.eastmoney.com/mxds/mcp"
@@ -38,9 +47,19 @@ _TENCENT_KLINE_MAX_COUNT = 2000
 _MX_REQUEST_RETRIES = 3
 _MX_MIN_INTERVAL_SECONDS = 3.0
 _MX_RETRY_BASE_DELAY_SECONDS = 2.0
+_MX_STATE_FILENAME = "mx-ratelimit.state"
+_MX_LOCK_WAIT_TIMEOUT_SECONDS = 180.0
+_MX_MAX_PAUSE_SECONDS = 60.0
 # The MX gateway answers HTTP 200 with a nested business status; these mark throttling.
-_MX_THROTTLE_CODES = {429, 503}
-_MX_THROTTLE_HINTS = ("过于频繁", "频繁", "限流", "rate limit", "too many requests")
+_MX_THROTTLE_CODES = {112, 429, 503}
+_MX_THROTTLE_HINTS = (
+    "频繁",
+    "频率",
+    "限流",
+    "稍后再试",
+    "rate limit",
+    "too many requests",
+)
 
 
 def _secid(ticker: str) -> str:
@@ -623,22 +642,158 @@ def _mx_int_env(name: str, default: int) -> int:
 
 _mx_request_lock = threading.Lock()
 _mx_last_request_at = 0.0
+_mx_cooldown_until = 0.0
+
+
+def _mx_state_path() -> str | None:
+    """Path of the file that carries MX pacing state across batch worker processes."""
+    override = os.getenv("MX_STATE_PATH", "").strip()
+    if override:
+        return override
+
+    try:
+        cache_dir = get_config()["data_cache_dir"]
+        os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, _MX_STATE_FILENAME)
+    except (KeyError, TypeError, OSError) as exc:
+        logger.debug("MX pacing state file unavailable: %s", exc)
+        return None
+
+
+def _read_mx_state(handle) -> tuple[float, float]:
+    """Return ``(last_request_at, cooldown_until)`` as wall-clock seconds."""
+    try:
+        handle.seek(0)
+        parts = handle.read().split()
+        return float(parts[0]), float(parts[1])
+    except (OSError, IndexError, ValueError):
+        return 0.0, 0.0
+
+
+def _write_mx_state(handle, last_request_at: float, cooldown_until: float) -> None:
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{last_request_at:.3f} {cooldown_until:.3f}")
+        handle.flush()
+        os.fsync(handle.fileno())
+    except OSError as exc:
+        logger.debug("MX pacing state write failed: %s", exc)
+
+
+def _acquire_mx_state_lock(path: str | None):
+    """Take an exclusive flock on the pacing state file. Never raises."""
+    if path is None or fcntl is None:
+        return None, False
+
+    handle = None
+    try:
+        handle = open(path, "a+", encoding="utf-8")
+        wait_timeout = _mx_float_env(
+            "MX_LOCK_WAIT_TIMEOUT_SECONDS", _MX_LOCK_WAIT_TIMEOUT_SECONDS
+        )
+        deadline = time.monotonic() + wait_timeout
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle, True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    # Losing cross-process pacing invites throttling, so say so.
+                    logger.warning(
+                        "MX pacing lock held by another process for over %.0fs;"
+                        " proceeding without cross-process pacing",
+                        time.monotonic() - (deadline - wait_timeout),
+                    )
+                    return handle, False
+                time.sleep(0.2)
+    except OSError as exc:
+        logger.debug("MX pacing lock unavailable: %s", exc)
+        if handle is not None:
+            handle.close()
+        return None, False
+
+
+def _release_mx_state_lock(handle, locked: bool) -> None:
+    if handle is None:
+        return
+    try:
+        if locked:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        handle.close()
+
+
+@contextmanager
+def _mx_state_gate(path: str | None):
+    """Yield an flock-held state file, or ``None`` when cross-process pacing is unavailable.
+
+    Batch mode analyses each ticker in its own subprocess, so an in-process lock cannot
+    keep siblings from bursting the per-API-key quota. Waiting is bounded: a stuck peer
+    must not deadlock the batch, and a throttled retry beats an indefinite hang.
+    """
+    handle, locked = _acquire_mx_state_lock(path)
+    try:
+        # Body exceptions must propagate untouched; urllib raises OSError subclasses.
+        yield handle if locked else None
+    finally:
+        _release_mx_state_lock(handle, locked)
+
+
+def _mx_pause_seconds(handle, min_interval: float) -> float:
+    """Seconds to wait before the next MX call, honouring in-process and shared state."""
+    now_mono = time.monotonic()
+    pause = max(
+        _mx_last_request_at + min_interval - now_mono,
+        _mx_cooldown_until - now_mono,
+    )
+    if handle is not None:
+        last_request_at, cooldown_until = _read_mx_state(handle)
+        now_wall = time.time()
+        pause = max(
+            pause,
+            last_request_at + min_interval - now_wall,
+            cooldown_until - now_wall,
+        )
+    # A peer that crashed mid-write, or a system clock jump, must not park us forever.
+    return min(pause, _MX_MAX_PAUSE_SECONDS)
 
 
 @contextmanager
 def _mx_request_slot():
-    """Serialize MX calls process-wide and space them out; the gateway throttles bursts."""
+    """Serialize MX calls across threads and batch processes; the gateway throttles bursts."""
     global _mx_last_request_at
 
     with _mx_request_lock:
-        idle = time.monotonic() - _mx_last_request_at
-        pause = _mx_float_env("MX_MIN_INTERVAL_SECONDS", _MX_MIN_INTERVAL_SECONDS) - idle
-        if pause > 0:
-            time.sleep(pause)
-        try:
-            yield
-        finally:
-            _mx_last_request_at = time.monotonic()
+        min_interval = _mx_float_env("MX_MIN_INTERVAL_SECONDS", _MX_MIN_INTERVAL_SECONDS)
+        with _mx_state_gate(_mx_state_path()) as handle:
+            while True:
+                pause = _mx_pause_seconds(handle, min_interval)
+                if pause <= 0:
+                    break
+                time.sleep(pause)
+            try:
+                yield
+            finally:
+                _mx_last_request_at = time.monotonic()
+                if handle is not None:
+                    _, cooldown_until = _read_mx_state(handle)
+                    _write_mx_state(handle, time.time(), cooldown_until)
+
+
+def _mx_hold_off(seconds: float) -> None:
+    """Park every caller after a throttle answer; the MX quota is shared per API key."""
+    global _mx_cooldown_until
+
+    _mx_cooldown_until = max(_mx_cooldown_until, time.monotonic() + seconds)
+
+    with _mx_state_gate(_mx_state_path()) as handle:
+        if handle is None:
+            return
+        last_request_at, cooldown_until = _read_mx_state(handle)
+        _write_mx_state(handle, last_request_at, max(cooldown_until, time.time() + seconds))
 
 
 def _mx_data_business_error(result) -> MxDataError | None:
@@ -696,6 +851,8 @@ def _post_mx_data(query: str, api_key: str, *, timeout: float, context: str) -> 
                 return result
             last_error = str(error)
             retryable = error.throttled
+            if error.throttled:
+                _mx_hold_off(delay)
 
         if not retryable or attempt == attempts:
             break
@@ -798,10 +955,10 @@ def _fetch_eastmoney_klines(
         with urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8", errors="replace"))
     except HTTPError as exc:
-        logger.warning("Eastmoney OHLCV HTTP error %s for %s", exc.code, ticker)
+        logger.debug("Eastmoney OHLCV HTTP error %s for %s", exc.code, ticker)
         raise NoMarketDataError(ticker, ticker, f"Eastmoney HTTP {exc.code}") from exc
     except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
-        logger.warning("Eastmoney OHLCV fetch failed for %s: %s", ticker, exc)
+        logger.debug("Eastmoney OHLCV fetch failed for %s: %s", ticker, exc)
         raise NoMarketDataError(ticker, ticker, f"Eastmoney error: {exc}") from exc
 
     klines = ((payload.get("data") or {}).get("klines") or []) if isinstance(payload, dict) else []
@@ -852,27 +1009,58 @@ def _fetch_tencent_klines(
         end_dt = datetime.strptime(window_end, "%Y-%m-%d")
         count = min(max((end_dt - start_dt).days + 10, 20), _TENCENT_KLINE_MAX_COUNT)
         param = f"{symbol},day,{window_start},{window_end},{count},qfq"
-        req = Request(
-            f"{_TENCENT_KLINE_URL}?{urlencode({'param': param})}",
-            headers={
-                "User-Agent": _UA,
-                "Referer": "https://finance.qq.com/",
-                "Accept": "application/json, text/plain, */*",
-            },
-        )
-        try:
-            with urlopen(req, timeout=timeout) as resp:
-                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
-        except HTTPError as exc:
-            logger.warning("Tencent OHLCV HTTP error %s for %s", exc.code, ticker)
-            raise NoMarketDataError(ticker, ticker, f"Tencent HTTP {exc.code}") from exc
-        except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
-            logger.warning("Tencent OHLCV fetch failed for %s: %s", ticker, exc)
-            raise NoMarketDataError(ticker, ticker, f"Tencent error: {exc}") from exc
+        last_error: Exception | None = None
+        answered = False
+        df = pd.DataFrame()
+        for url in _TENCENT_KLINE_URLS:
+            req = Request(
+                f"{url}?{urlencode({'param': param})}",
+                headers={
+                    "User-Agent": _UA,
+                    "Referer": "https://finance.qq.com/",
+                    "Accept": "application/json, text/plain, */*",
+                },
+            )
+            try:
+                with urlopen(req, timeout=timeout) as resp:
+                    payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            except HTTPError as exc:
+                last_error = NoMarketDataError(ticker, ticker, f"Tencent HTTP {exc.code}")
+                last_error.__cause__ = exc
+                # Direct ifzq host is often intercepted by Tencent Cloud WAF (HTTP 501).
+                if exc.code in {403, 501, 502, 503}:
+                    logger.debug(
+                        "Tencent OHLCV HTTP %s from %s for %s; trying next host",
+                        exc.code,
+                        url,
+                        ticker,
+                    )
+                    continue
+                logger.warning("Tencent OHLCV HTTP error %s for %s", exc.code, ticker)
+                raise last_error from exc
+            except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+                last_error = NoMarketDataError(ticker, ticker, f"Tencent error: {exc}")
+                last_error.__cause__ = exc
+                logger.debug("Tencent OHLCV fetch failed via %s for %s: %s", url, ticker, exc)
+                continue
 
-        df = _tencent_rows_to_dataframe(_extract_tencent_rows(payload, symbol))
-        if not df.empty:
-            frames.append(df)
+            answered = True
+            df = _tencent_rows_to_dataframe(_extract_tencent_rows(payload, symbol))
+            if not df.empty:
+                break
+
+        if df.empty:
+            # An empty payload from a healthy host means the window has no trading
+            # days (pre-IPO, long suspension), so only a transport failure is fatal.
+            if not answered and last_error is not None:
+                cause = last_error.__cause__
+                if isinstance(cause, HTTPError):
+                    logger.warning("Tencent OHLCV HTTP error %s for %s", cause.code, ticker)
+                else:
+                    logger.warning("Tencent OHLCV fetch failed for %s: %s", ticker, last_error)
+                raise last_error
+            continue
+        frames.append(df)
 
     if not frames:
         raise NoMarketDataError(ticker, ticker, f"Tencent returned no rows between {start_date} and {end_date}")
@@ -922,24 +1110,42 @@ def get_cn_a_share_short_name(ticker: str, *, timeout: float = 8.0) -> str | Non
 
 def _fetch_preferred_eastmoney_ohlcv(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
     """Fetch A-share OHLCV from MX, then Eastmoney, then Tencent."""
+    # A recovered fallback is not a problem worth a warning; only an exhausted chain is.
+    failures: list[str] = []
+
     if os.getenv("MX_APIKEY", "").strip():
         try:
             return _fetch_mx_data_ohlcv(symbol, start_date, end_date)
-        except NoMarketDataError as exc:
-            logger.warning("MX data OHLCV fetch failed for %s: %s", symbol, exc)
-        except (HTTPError, OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
-            logger.warning("MX data OHLCV fetch failed for %s: %s", symbol, exc)
+        except (
+            NoMarketDataError,
+            HTTPError,
+            OSError,
+            http.client.HTTPException,
+            json.JSONDecodeError,
+        ) as exc:
+            failures.append(f"MX data: {exc}")
+            logger.debug("MX data OHLCV fetch failed for %s: %s", symbol, exc)
 
     try:
         return _fetch_eastmoney_klines(symbol, start_date, end_date)
     except NoMarketDataError as exc:
-        logger.warning(
+        failures.append(f"Eastmoney: {exc}")
+        logger.debug(
             "Eastmoney OHLCV fetch failed for %s: %s; falling back to Tencent",
             symbol,
             exc,
         )
 
-    return _fetch_tencent_klines(symbol, start_date, end_date)
+    try:
+        return _fetch_tencent_klines(symbol, start_date, end_date)
+    except NoMarketDataError:
+        if failures:
+            logger.warning(
+                "A-share OHLCV sources exhausted for %s: %s",
+                symbol,
+                "; ".join(failures),
+            )
+        raise
 
 
 def get_stock_data_eastmoney(symbol: str, start_date: str, end_date: str) -> str:

@@ -41,6 +41,14 @@ _RATING_PATTERNS = (
 )
 _PRICE_TARGET_RE = re.compile(r"^\*\*Price Target\*\*[:：]\s*(.+)$", re.MULTILINE)
 _TIME_HORIZON_RE = re.compile(r"^\*\*Time Horizon\*\*[:：]\s*(.+)$", re.MULTILINE)
+# The trader writes the entry level, so it sits above the Portfolio Manager section.
+_ENTRY_PRICE_RE = re.compile(r"^\*\*Entry Price\*\*[:：]\s*(.+)$", re.MULTILINE)
+
+# Ratings for which the entry level is actionable enough to show in the rollup.
+_BULLISH_RATINGS = frozenset(
+    f"{english}（{chinese}）"
+    for english, chinese in (_RATINGS["buy"], _RATINGS["overweight"])
+)
 
 
 def _normalize_rating(raw: str) -> str | None:
@@ -72,11 +80,13 @@ def parse_final_decision(report_md: str) -> dict:
 
     price_target = _PRICE_TARGET_RE.search(section)
     time_horizon = _TIME_HORIZON_RE.search(section)
+    entry_price = _ENTRY_PRICE_RE.search(report_md)
     ticker = _TICKER_RE.search(report_md)
     return {
         "rating": rating,
         "price_target": price_target.group(1).strip() if price_target else None,
         "time_horizon": time_horizon.group(1).strip() if time_horizon else None,
+        "entry_price": entry_price.group(1).strip() if entry_price else None,
         "ticker": ticker.group(1).strip() if ticker else None,
     }
 
@@ -135,9 +145,16 @@ def _latest_run(runs: list[dict]) -> dict:
 
 def _instrument_label(instrument: str, run: dict) -> str:
     ticker = run.get("ticker")
-    name = f"{instrument}（{ticker}）" if ticker else instrument
+    parts = [f"{instrument}（{ticker}）" if ticker else instrument]
     report_date = (run.get("time") or "").split(" ", 1)[0]
-    return f"{name}，{report_date}" if report_date else name
+    if report_date:
+        parts.append(report_date)
+    entry_price = run.get("entry_price")
+    if entry_price and run.get("rating") in _BULLISH_RATINGS:
+        parts.append(_escape_cell(entry_price))
+    label = "，".join(parts)
+    path = run.get("path")
+    return f"{label} [打开]({path})" if path else label
 
 
 def _rating_sort_key(rating: str | None) -> tuple[int, str]:

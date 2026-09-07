@@ -155,7 +155,7 @@ MODEL_OPTIONS: ProviderModeOptions = {
     "minimax-cn": _MINIMAX_MODELS,
     "mimo": {
         "quick": [
-            ("MiMo V2.5 Pro - Fast model", "mimo-v2.5-pro"),
+            ("MiMo V2.5 - Fast model", "mimo-v2.5"),
         ],
         "deep": [
             ("MiMo V2.5 Pro - Most capable model", "mimo-v2.5-pro"),

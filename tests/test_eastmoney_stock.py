@@ -92,7 +92,7 @@ def test_fetch_tencent_klines_reads_qfqday_and_filters_range():
     assert list(df.index) == [pd.Timestamp("2026-07-01"), pd.Timestamp("2026-07-02")]
     assert df.loc[pd.Timestamp("2026-07-02"), "Close"] == 34.1
     request = urlopen.call_args.args[0]
-    assert "web.ifzq.gtimg.cn" in request.full_url
+    assert "proxy.finance.qq.com" in request.full_url
     assert "sh603881" in request.full_url
     assert "qfq" in request.full_url
 
@@ -126,6 +126,67 @@ def test_fetch_tencent_klines_chunks_multi_year_range():
     urls = [call.args[0].full_url for call in urlopen.call_args_list]
     assert "2025-12-31" in urls[0]
     assert "2026-01-02" in urls[1]
+
+
+@pytest.mark.unit
+def test_fetch_tencent_klines_skips_windows_without_trading_days():
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    def response_for(payload):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(payload).encode("utf-8")
+        return response
+
+    # Pre-IPO years answer with an empty "day" list on every host.
+    empty = {"code": 0, "data": {"sh603296": {"day": [], "qt": {"sh603296": ["1"]}}}}
+    listed = {
+        "code": 0,
+        "data": {"sh603296": {"qfqday": [["2026-01-05", "64.53", "67.07", "67.14", "64.24", "143185"]]}},
+    }
+    responses = [response_for(empty) for _ in em._TENCENT_KLINE_URLS]
+    responses.append(response_for(listed))
+
+    with mock.patch.object(em, "urlopen", side_effect=responses):
+        df = em._fetch_tencent_klines("603296.SS", "2025-01-01", "2026-01-05")
+
+    assert list(df.index) == [pd.Timestamp("2026-01-05")]
+    assert df.loc[pd.Timestamp("2026-01-05"), "Close"] == 67.07
+
+
+@pytest.mark.unit
+def test_fetch_tencent_klines_falls_back_after_waf_501():
+    from urllib.error import HTTPError
+
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    payload = {
+        "code": 0,
+        "data": {
+            "sz002600": {
+                "qfqday": [
+                    ["2026-08-26", "12.23", "12.25", "12.45", "12.17", "653259"],
+                ]
+            }
+        },
+    }
+    ok = mock.MagicMock()
+    ok.__enter__.return_value.read.return_value = json.dumps(payload).encode("utf-8")
+    waf = HTTPError(
+        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+        501,
+        "Not Implemented",
+        hdrs=None,
+        fp=None,
+    )
+
+    with mock.patch.object(em, "urlopen", side_effect=[waf, ok]) as urlopen:
+        df = em._fetch_tencent_klines("002600.SZ", "2026-08-26", "2026-08-26")
+
+    assert urlopen.call_count == 2
+    urls = [call.args[0].full_url for call in urlopen.call_args_list]
+    assert "proxy.finance.qq.com" in urls[0]
+    assert "web.ifzq.gtimg.cn" in urls[1] or "newfqkline" in urls[1]
+    assert df.loc[pd.Timestamp("2026-08-26"), "Close"] == 12.25
 
 
 @pytest.mark.unit
@@ -467,13 +528,13 @@ def test_mxds_tool_selection_prefers_a_share_finance_tool():
     assert _choose_mxds_kline_tool(tools)["name"] == "mx_ashare_finance_data"
 
 
-def _mx_throttled_response():
+def _mx_throttled_response(message: str = "操作过于频繁", code: int = 503):
     payload = {
         "success": True,
         "status": 0,
         "code": 0,
         "message": "ok",
-        "data": {"message": "操作过于频繁", "status": -1, "code": 503, "data": None},
+        "data": {"message": message, "status": -1, "code": code, "data": None},
     }
     response = mock.MagicMock()
     response.__enter__.return_value.read.return_value = json.dumps(payload).encode("utf-8")
@@ -555,6 +616,236 @@ def test_mx_data_retries_throttle_then_returns_rows(monkeypatch):
 
     assert urlopen.call_count == 2
     assert df.loc[pd.Timestamp("2026-07-01"), "Close"] == 33.25
+
+
+@pytest.mark.unit
+def test_mx_data_retries_code_112_rate_limit(monkeypatch):
+    """The live gateway answers code 112 / 请求频率过高 instead of 429."""
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    monkeypatch.setenv("MX_APIKEY", "test-key")
+    monkeypatch.setenv("MX_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("MX_RETRY_BASE_DELAY_SECONDS", "0")
+
+    throttled = _mx_throttled_response("请求频率过高，请稍后再试", code=112)
+    with mock.patch.object(
+        em,
+        "urlopen",
+        side_effect=[throttled, _mx_ohlcv_response()],
+    ) as urlopen, mock.patch.object(em, "_assert_ohlcv_not_stale"):
+        df = em._fetch_mx_data_ohlcv("603296.SS", "2026-07-01", "2026-07-01")
+
+    assert urlopen.call_count == 2
+    assert df.loc[pd.Timestamp("2026-07-01"), "Close"] == 33.25
+
+
+@pytest.mark.unit
+def test_mx_throttle_holds_off_other_threads(monkeypatch):
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    monkeypatch.setenv("MX_APIKEY", "test-key")
+    monkeypatch.setenv("MX_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("MX_RETRY_BASE_DELAY_SECONDS", "0.05")
+    monkeypatch.setattr(em, "_mx_cooldown_until", 0.0)
+
+    throttled = _mx_throttled_response("请求频率过高，请稍后再试", code=112)
+    with mock.patch.object(
+        em,
+        "urlopen",
+        side_effect=[throttled, _mx_ohlcv_response()],
+    ), mock.patch.object(em, "_assert_ohlcv_not_stale"):
+        em._fetch_mx_data_ohlcv("603296.SS", "2026-07-01", "2026-07-01")
+
+    assert em._mx_cooldown_until > 0.0
+
+
+@pytest.mark.unit
+def test_preferred_ohlcv_stays_quiet_when_tencent_recovers(monkeypatch, caplog):
+    from tradingagents.dataflows import eastmoney_stock as em
+    from tradingagents.dataflows.errors import NoMarketDataError
+
+    frame = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(["2026-07-01"]),
+            "Open": [33.0],
+            "High": [33.8],
+            "Low": [32.9],
+            "Close": [33.25],
+            "Adj Close": [33.25],
+            "Volume": [1234],
+        }
+    ).set_index("Date")
+
+    monkeypatch.setenv("MX_APIKEY", "test-key")
+    with caplog.at_level("WARNING", logger=em.logger.name), mock.patch.object(
+        em,
+        "_fetch_mx_data_ohlcv",
+        side_effect=NoMarketDataError("603296.SS", "603296.SS", "MX data API error 112"),
+    ), mock.patch.object(
+        em,
+        "_fetch_eastmoney_klines",
+        side_effect=NoMarketDataError("603296.SS", "603296.SS", "Eastmoney error"),
+    ), mock.patch.object(em, "_fetch_tencent_klines", return_value=frame):
+        em._fetch_preferred_eastmoney_ohlcv("603296.SS", "2026-07-01", "2026-07-01")
+
+    assert caplog.records == []
+
+
+@pytest.mark.unit
+def test_preferred_ohlcv_warns_once_when_every_source_fails(monkeypatch, caplog):
+    from tradingagents.dataflows import eastmoney_stock as em
+    from tradingagents.dataflows.errors import NoMarketDataError
+
+    monkeypatch.setenv("MX_APIKEY", "test-key")
+    with caplog.at_level("WARNING", logger=em.logger.name), mock.patch.object(
+        em,
+        "_fetch_mx_data_ohlcv",
+        side_effect=NoMarketDataError("603296.SS", "603296.SS", "MX data API error 112"),
+    ), mock.patch.object(
+        em,
+        "_fetch_eastmoney_klines",
+        side_effect=NoMarketDataError("603296.SS", "603296.SS", "Eastmoney error"),
+    ), mock.patch.object(
+        em,
+        "_fetch_tencent_klines",
+        side_effect=NoMarketDataError("603296.SS", "603296.SS", "Tencent error"),
+    ):
+        with pytest.raises(NoMarketDataError):
+            em._fetch_preferred_eastmoney_ohlcv("603296.SS", "2026-07-01", "2026-07-01")
+
+    assert len(caplog.records) == 1
+    assert "sources exhausted" in caplog.records[0].getMessage()
+
+
+@pytest.mark.unit
+def test_mx_request_slot_records_wall_clock_state(monkeypatch, tmp_path):
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    state = tmp_path / "pacing.state"
+    monkeypatch.setenv("MX_STATE_PATH", str(state))
+    monkeypatch.setenv("MX_MIN_INTERVAL_SECONDS", "0")
+
+    before = time.time()
+    with em._mx_request_slot():
+        pass
+
+    last_request_at, cooldown_until = (float(part) for part in state.read_text().split())
+    assert last_request_at >= before - 0.01  # state is persisted at millisecond precision
+    assert cooldown_until == 0.0
+
+
+@pytest.mark.unit
+def test_mx_request_slot_waits_for_state_file_interval(monkeypatch, tmp_path):
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    state = tmp_path / "pacing.state"
+    # A sibling batch process just fired a request; we must not burst on top of it.
+    state.write_text(f"{time.time():.3f} 0.000")
+    monkeypatch.setenv("MX_STATE_PATH", str(state))
+    monkeypatch.setenv("MX_MIN_INTERVAL_SECONDS", "0.4")
+
+    started = time.monotonic()
+    with em._mx_request_slot():
+        pass
+
+    assert time.monotonic() - started >= 0.3
+
+
+@pytest.mark.unit
+def test_mx_hold_off_publishes_cooldown_to_state_file(monkeypatch, tmp_path):
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    state = tmp_path / "pacing.state"
+    monkeypatch.setenv("MX_STATE_PATH", str(state))
+
+    before = time.time()
+    em._mx_hold_off(30.0)
+
+    _, cooldown_until = (float(part) for part in state.read_text().split())
+    assert cooldown_until >= before + 30.0
+
+
+@pytest.mark.unit
+def test_mx_request_slot_honours_cooldown_from_other_process(monkeypatch, tmp_path):
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    state = tmp_path / "pacing.state"
+    state.write_text(f"0.000 {time.time() + 0.4:.3f}")
+    monkeypatch.setenv("MX_STATE_PATH", str(state))
+    monkeypatch.setenv("MX_MIN_INTERVAL_SECONDS", "0")
+
+    started = time.monotonic()
+    with em._mx_request_slot():
+        pass
+
+    assert time.monotonic() - started >= 0.3
+
+
+@pytest.mark.unit
+def test_mx_pacing_caps_pause_on_absurd_state(monkeypatch, tmp_path):
+    """A crashed peer or a clock jump must not park callers for hours."""
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    state = tmp_path / "pacing.state"
+    state.write_text(f"0.000 {time.time() + 86400:.3f}")
+    monkeypatch.setenv("MX_STATE_PATH", str(state))
+    monkeypatch.setenv("MX_MIN_INTERVAL_SECONDS", "0")
+
+    with open(state, "a+", encoding="utf-8") as handle:
+        assert em._mx_pause_seconds(handle, 0.0) == em._MX_MAX_PAUSE_SECONDS
+
+
+@pytest.mark.unit
+def test_mx_pacing_degrades_when_lock_unavailable(monkeypatch):
+    """No flock (e.g. Windows) must not break fetching, only lose cross-process pacing."""
+    from tradingagents.dataflows import eastmoney_stock as em
+
+    monkeypatch.setattr(em, "fcntl", None)
+    monkeypatch.setenv("MX_MIN_INTERVAL_SECONDS", "0")
+
+    with em._mx_state_gate("/nonexistent/dir/pacing.state") as handle:
+        assert handle is None
+
+
+@pytest.mark.unit
+def test_mx_pacing_serializes_across_processes(tmp_path):
+    import subprocess
+    import sys
+    import textwrap
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    state = tmp_path / "pacing.state"
+    script = textwrap.dedent(
+        """
+        import os, sys, time
+        os.environ["MX_STATE_PATH"] = sys.argv[1]
+        os.environ["MX_MIN_INTERVAL_SECONDS"] = "0"
+        from tradingagents.dataflows import eastmoney_stock as em
+        with em._mx_request_slot():
+            print(f"enter {time.time():.3f}", flush=True)
+            time.sleep(0.5)
+            print(f"exit {time.time():.3f}", flush=True)
+        """
+    )
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(state)],
+            stdout=subprocess.PIPE,
+            text=True,
+            cwd=str(repo_root),
+        )
+        for _ in range(2)
+    ]
+    spans = []
+    for proc in procs:
+        out, _ = proc.communicate(timeout=120)
+        stamps = [line.split()[1] for line in out.splitlines() if line.startswith(("enter", "exit"))]
+        assert len(stamps) == 2, out
+        spans.append((float(stamps[0]), float(stamps[1])))
+
+    spans.sort()
+    assert spans[1][0] >= spans[0][1], f"MX slots overlapped across processes: {spans}"
 
 
 @pytest.mark.unit

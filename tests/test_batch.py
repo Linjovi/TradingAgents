@@ -11,6 +11,7 @@ from cli.batch import (
     deserialize_selections,
     list_ticker_entries,
     parse_ticker_choice,
+    run_parallel,
     selections_for_ticker,
     serialize_selections,
 )
@@ -141,3 +142,59 @@ def test_worker_payload_auto_saves_and_strips_checkpoint(tmp_path, monkeypatch):
     assert captured["prompt_display"] is False
     assert captured["selections"]["ticker"] == "002475.SZ"
     assert "_checkpoint" not in captured["selections"]
+
+
+def _minimal_batch_selections() -> dict:
+    return {
+        "ticker": "002475.SZ",
+        "asset_type": "stock",
+        "analysis_date": "2026-08-25",
+        "analysts": [AnalystType.MARKET],
+        "research_depth": 1,
+        "llm_provider": "mimo",
+        "backend_url": "https://example.com",
+        "shallow_thinker": "fast",
+        "deep_thinker": "slow",
+        "google_thinking_level": None,
+        "openai_reasoning_effort": None,
+        "anthropic_effort": None,
+        "output_language": "Chinese",
+    }
+
+
+@pytest.mark.unit
+def test_run_parallel_staggers_worker_starts(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr("cli.batch.time.sleep", sleeps.append)
+    monkeypatch.setattr(
+        "cli.batch._spawn_worker",
+        lambda ticker, payload, checkpoint: (ticker, 0),
+    )
+
+    code = run_parallel(
+        ["002475.SZ", "601138.SS", "002837.SZ"],
+        _minimal_batch_selections(),
+        stagger_seconds=30,
+    )
+
+    assert code == 0
+    assert sleeps == [30, 30]
+
+
+@pytest.mark.unit
+def test_run_parallel_skips_stagger_when_delay_is_zero(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr("cli.batch.time.sleep", sleeps.append)
+    monkeypatch.setattr(
+        "cli.batch._spawn_worker",
+        lambda ticker, payload, checkpoint: (ticker, 0),
+    )
+
+    code = run_parallel(
+        ["002475.SZ", "601138.SS"],
+        _minimal_batch_selections(),
+        stagger_seconds=0,
+    )
+
+    assert code == 0
+    assert sleeps == []

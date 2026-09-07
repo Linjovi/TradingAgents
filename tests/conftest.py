@@ -56,6 +56,21 @@ def _isolate_config():
     config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_mx_pacing(tmp_path, monkeypatch):
+    """Keep MX pacing state out of the real cache dir.
+
+    The MX rate limiter coordinates through an flock'd file so batch subprocesses
+    share one quota. Without this, a test run would contend with a live analysis
+    for that lock and block until the wait timeout.
+    """
+    from tradingagents.dataflows import eastmoney_stock
+
+    monkeypatch.setenv("MX_STATE_PATH", str(tmp_path / "mx-ratelimit.state"))
+    monkeypatch.setattr(eastmoney_stock, "_mx_last_request_at", 0.0)
+    monkeypatch.setattr(eastmoney_stock, "_mx_cooldown_until", 0.0)
+
+
 @pytest.fixture()
 def mock_llm_client():
     client = MagicMock()
